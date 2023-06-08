@@ -7,9 +7,13 @@ edition = "2021"
 bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
-hashbrown = {workspace = true }
 locutus-stdlib = { workspace = true }
-ed25519-dalek = { workspace = true }
+rsa = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 strum = { version = "0.24", features = ["derive"] }
 thiserror = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# FIXME: addign rand here pulls rand for transitive deps and gets included in the final wasm32 bin
+rand = "0.8"

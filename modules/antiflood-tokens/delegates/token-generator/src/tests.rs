@@ -3,9 +3,9 @@ use super::*;
 mod token_assignment {
     use super::*;
     use chrono::{NaiveDate, Timelike};
-    use ed25519_dalek::{PublicKey, Signature};
     use locutus_aft_interface::Tier;
     use once_cell::sync::Lazy;
+    use rsa::{pkcs1v15::Signature, RsaPublicKey};
 
     fn get_assignment_date(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         let naive = NaiveDate::from_ymd_opt(y, m, d)
@@ -18,8 +18,10 @@ mod token_assignment {
     const TEST_TIER: Tier = Tier::Day1;
     const MAX_DURATION_1Y: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 
-    static PK: Lazy<PublicKey> =
-        Lazy::new(|| PublicKey::from_bytes(&[1; ed25519_dalek::PUBLIC_KEY_LENGTH]).unwrap());
+    const RSA_4096_PUB_PEM: &str = include_str!("../../../interfaces/examples/rsa4096-pub.pem");
+    static PK: Lazy<RsaPublicKey> = Lazy::new(|| {
+        <RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM).unwrap()
+    });
 
     static ID: Lazy<ContractInstanceId> = Lazy::new(|| {
         let rnd = [1; 32];
@@ -34,8 +36,8 @@ mod token_assignment {
             vec![TokenAssignment {
                 tier: TEST_TIER,
                 time_slot: get_assignment_date(2023, 1, 25),
-                assignee: *PK,
-                signature: Signature::from([1; 64]),
+                assignee: PK.clone(),
+                signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                 assignment_hash: [0; 32],
                 token_record: *ID,
             }],
@@ -55,16 +57,16 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2023, 1, 26),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
@@ -85,16 +87,16 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 29),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
@@ -112,24 +114,24 @@ mod token_assignment {
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 27),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 28),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },
                 TokenAssignment {
                     tier: TEST_TIER,
                     time_slot: get_assignment_date(2022, 1, 30),
-                    assignee: *PK,
-                    signature: Signature::from([1; 64]),
+                    assignee: PK.clone(),
+                    signature: Signature::from(vec![1u8; 64].into_boxed_slice()),
                     assignment_hash: [0; 32],
                     token_record: *ID,
                 },

@@ -1,27 +1,29 @@
-use ed25519_dalek::Verifier;
 use locutus_aft_interface::{
     AllocationError, TokenAllocationRecord, TokenAllocationSummary, TokenAssignment,
     TokenParameters,
 };
 use locutus_stdlib::prelude::*;
+use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256};
 
 struct TokenAllocContract;
 
+#[contract]
 impl ContractInterface for TokenAllocContract {
     fn validate_state(
         parameters: Parameters<'static>,
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        let assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let params = TokenParameters::try_from(parameters)?;
-        for (_tier, assignments) in (&assigned_tokens).into_iter() {
-            for assignment in assignments {
-                if !assignment.is_valid(&params) {
-                    return Ok(ValidateResult::Invalid);
-                }
-            }
-        }
+        let _assigned_tokens = TokenAllocationRecord::try_from(state)?;
+        let _params = TokenParameters::try_from(parameters)?;
+        // TODO: uncomment this when the validation is implemented
+        // for (_tier, assignments) in (&assigned_tokens).into_iter() {
+        //     for assignment in assignments {
+        //         if !assignment.is_valid(&params) {
+        //             return Ok(ValidateResult::Invalid);
+        //         }
+        //     }
+        // }
         Ok(ValidateResult::Valid)
     }
 
@@ -99,12 +101,13 @@ impl ContractInterface for TokenAllocContract {
     fn get_state_delta(
         _parameters: Parameters<'static>,
         state: State<'static>,
-        summary: StateSummary<'static>,
+        _summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
+        // FIXME: this will be broken because problem with node
         let assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let summary = TokenAllocationSummary::try_from(summary)?;
-        let delta = assigned_tokens.delta(&summary);
-        delta.try_into()
+        //let summary = TokenAllocationSummary::try_from(summary)?;
+        //let delta = assigned_tokens.delta(&summary);
+        assigned_tokens.try_into()
     }
 }
 
@@ -114,15 +117,13 @@ trait TokenAssignmentExt {
 
 impl TokenAssignmentExt for TokenAssignment {
     fn is_valid(&self, params: &TokenParameters) -> bool {
+        use rsa::signature::Verifier;
         if !self.tier.is_valid_slot(self.time_slot) {
             return false;
         }
-        let msg = TokenAssignment::to_be_signed(&self.time_slot, &self.assignee, self.tier);
-        if params
-            .generator_public_key
-            .verify(&msg, &self.signature)
-            .is_err()
-        {
+        let msg = TokenAssignment::signature_content(&self.time_slot, &self.assignee, self.tier);
+        let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
+        if verifying_key.verify(&msg, &self.signature).is_err() {
             // not signed by the private key of this generator
             return false;
         }

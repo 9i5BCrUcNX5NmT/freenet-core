@@ -5,12 +5,14 @@ use axum::extract::{Path, WebSocketUpgrade};
 use axum::response::{Html, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use locutus_core::locutus_runtime::TryFromTsStd;
 use locutus_core::*;
 use locutus_runtime::ContractKey;
 use locutus_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse,
+    TryFromTsStd,
 };
+use rmp_serde::Deserializer;
+use serde::Deserialize;
 use std::{
     collections::HashMap,
     sync::{
@@ -219,8 +221,10 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
 
-    let req: ClientRequest = {
-        match ContractRequest::try_decode(&msg) {
+    let mut deserializer = Deserializer::new(&msg[..]);
+    let req: ClientRequest = match ClientRequest::deserialize(&mut deserializer) {
+        Ok(client_request) => client_request,
+        Err(_) => match ContractRequest::try_decode(&msg) {
             Ok(r) => r.into(),
             Err(e) => {
                 let result_error = rmp_serde::to_vec(&Err::<HostResponse, ClientError>(
@@ -232,8 +236,9 @@ async fn process_client_request(
                 .map_err(|err| Some(err.into()))?;
                 return Ok(Some(Message::Binary(result_error)));
             }
-        }
+        },
     };
+
     tracing::debug!(req = %req, "received client request");
     request_sender
         .send(ClientConnection::Request { client_id, req })
@@ -255,9 +260,15 @@ async fn process_host_response(
                     tracing::debug!(response = %res, cli_id = %id, "sending response");
                     match res {
                         HostResponse::ContractResponse(ContractResponse::GetResponse {
+                            key,
                             contract,
                             state,
-                        }) => Ok(ContractResponse::GetResponse { contract, state }.into()),
+                        }) => Ok(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }
+                        .into()),
                         other => Ok(other),
                     }
                 }
@@ -303,7 +314,7 @@ impl HttpGateway {
             }
             ClientConnection::Request {
                 client_id,
-                req: ClientRequest::ContractOp(ContractRequest::Subscribe { key }),
+                req: ClientRequest::ContractOp(ContractRequest::Subscribe { key, summary }),
             } => {
                 // intercept subscription messages because they require a callback subscription channel
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -315,8 +326,11 @@ impl HttpGateway {
                     })
                     .map_err(|_| ErrorKind::ChannelClosed)?;
                     Ok(Some(
-                        OpenRequest::new(client_id, ContractRequest::Subscribe { key }.into())
-                            .with_notification(tx),
+                        OpenRequest::new(
+                            client_id,
+                            ContractRequest::Subscribe { key, summary }.into(),
+                        )
+                        .with_notification(tx),
                     ))
                 } else {
                     tracing::warn!("client: {client_id} not found");
@@ -363,6 +377,8 @@ impl ClientEventsProxy for HttpGateway {
                 if ch.send(HostCallbackResult::Result { id, result }).is_ok() && !should_rm {
                     // still alive connection, keep it
                     self.response_channels.insert(id, ch);
+                } else {
+                    tracing::info!("dropped connection to client #{id}");
                 }
             } else {
                 tracing::warn!("client: {id} not found");

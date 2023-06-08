@@ -1,15 +1,14 @@
 use std::{collections::HashMap, fmt::Display, io::Cursor};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     delegate_interface::{Delegate, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg},
-    prelude::{
-        ContractKey, RelatedContracts, StateSummary, TryFromTsStd, UpdateData, WrappedState,
-        WsApiError,
-    },
+    prelude::{ContractKey, Parameters, RelatedContracts, StateSummary, UpdateData, WrappedState},
     versioning::ContractContainer,
 };
+
+use super::{TryFromTsStd, WsApiError};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientError {
@@ -48,14 +47,14 @@ pub enum ErrorKind {
     IncorrectState(ContractKey),
     #[error("node not available")]
     NodeUnavailable,
-    #[error("undhandled error: {0}")]
-    Other(String),
     #[error("lost the connection with the protocol hanling connections")]
     TransportProtocolDisconnect,
     #[error("unhandled error: {cause}")]
     Unhandled { cause: String },
     #[error("unknown client id: {0}")]
     UnknownClient(usize),
+    #[error(transparent)]
+    RequestError(#[from] RequestError),
 }
 
 impl Display for ClientError {
@@ -65,6 +64,42 @@ impl Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+pub enum RequestError {
+    #[error(transparent)]
+    ContractError(#[from] ContractError),
+    #[error(transparent)]
+    DelegateError(#[from] DelegateError),
+    #[error("client disconnect")]
+    Disconnect,
+}
+
+/// Errors that may happen while interacting with delegates.
+#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+pub enum DelegateError {
+    #[error("error while registering delegate: {0}")]
+    RegisterError(DelegateKey),
+    #[error("execution error, cause: {0}")]
+    ExecutionError(String),
+}
+
+/// Errors that may happen while interacting with contracts.
+#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
+pub enum ContractError {
+    #[error("failed to get contract {key}, reason: {cause}")]
+    Get { key: ContractKey, cause: String },
+    #[error("put error for contract {key}, reason: {cause}")]
+    Put { key: ContractKey, cause: String },
+    #[error("update error for contract {key}, reason: {cause}")]
+    Update { key: ContractKey, cause: String },
+    #[error("failed to subscribe for contract {key}, reason: {cause}")]
+    Subscribe { key: ContractKey, cause: String },
+    #[error("missing related contract: {key}")]
+    MissingRelated {
+        key: crate::contract_interface::ContractInstanceId,
+    },
+}
 
 /// A request from a client application to the host.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -104,7 +139,10 @@ impl ClientRequest<'_> {
                         key,
                         fetch_contract,
                     },
-                    ContractRequest::Subscribe { key } => ContractRequest::Subscribe { key },
+                    ContractRequest::Subscribe { key, summary } => ContractRequest::Subscribe {
+                        key,
+                        summary: summary.map(StateSummary::into_owned),
+                    },
                 };
                 owned.into()
             }
@@ -148,7 +186,10 @@ pub enum ContractRequest<'a> {
     },
     /// Subscribe to the changes in a given contract. Implicitly starts a get operation
     /// if the contract is not present yet.
-    Subscribe { key: ContractKey },
+    Subscribe {
+        key: ContractKey,
+        summary: Option<StateSummary<'a>>,
+    },
 }
 
 impl<'a> From<ContractRequest<'a>> for ClientRequest<'a> {
@@ -205,9 +246,14 @@ impl<'a> TryFromTsStd<&[u8]> for ContractRequest<'a> {
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?,
                         fetch_contract: value_map.get("fetchContract").unwrap().as_bool().unwrap(),
                     },
-                    ["key"] => ContractRequest::Subscribe {
+                    ["key", "summary"] => ContractRequest::Subscribe {
                         key: ContractKey::try_decode(*value_map.get("key").unwrap())
                             .map_err(|err| WsApiError::deserialization(err.to_string()))?,
+                        summary: value_map
+                            .get("summary")
+                            .unwrap()
+                            .as_slice()
+                            .map(|s| StateSummary::from(s).into_owned()),
                     },
                     _ => unreachable!(),
                 }
@@ -232,12 +278,17 @@ impl<'a> From<DelegateRequest<'a>> for ClientRequest<'a> {
 pub enum DelegateRequest<'a> {
     ApplicationMessages {
         key: DelegateKey,
+        #[serde(
+            serialize_with = "DelegateRequest::ser_params",
+            deserialize_with = "DelegateRequest::deser_params"
+        )]
+        params: Parameters<'a>,
         inbound: Vec<InboundDelegateMsg<'a>>,
     },
     RegisterDelegate {
         #[serde(borrow)]
-        component: Delegate<'a>,
-        cipher: [u8; 24],
+        delegate: Delegate<'a>,
+        cipher: [u8; 32],
         nonce: [u8; 24],
     },
     UnregisterDelegate(DelegateKey),
@@ -246,26 +297,41 @@ pub enum DelegateRequest<'a> {
 impl DelegateRequest<'_> {
     pub fn into_owned(self) -> DelegateRequest<'static> {
         match self {
-            DelegateRequest::ApplicationMessages { key, inbound } => {
-                DelegateRequest::ApplicationMessages {
-                    key,
-                    inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
-                }
-            }
+            DelegateRequest::ApplicationMessages {
+                key,
+                inbound,
+                params,
+            } => DelegateRequest::ApplicationMessages {
+                key,
+                params: params.into_owned(),
+                inbound: inbound.into_iter().map(|e| e.into_owned()).collect(),
+            },
             DelegateRequest::RegisterDelegate {
-                component,
+                delegate,
                 cipher,
                 nonce,
-            } => {
-                let component = component.into_owned();
-                DelegateRequest::RegisterDelegate {
-                    component,
-                    cipher,
-                    nonce,
-                }
-            }
+            } => DelegateRequest::RegisterDelegate {
+                delegate: delegate.into_owned(),
+                cipher,
+                nonce,
+            },
             DelegateRequest::UnregisterDelegate(key) => DelegateRequest::UnregisterDelegate(key),
         }
+    }
+
+    fn ser_params<S>(data: &Parameters<'_>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        data.serialize(ser)
+    }
+
+    fn deser_params<'de, 'a, D>(deser: D) -> Result<Parameters<'a>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes_vec: Vec<u8> = Deserialize::deserialize(deser)?;
+        Ok(Parameters::from(bytes_vec))
     }
 }
 
@@ -288,7 +354,7 @@ impl Display for ClientRequest<'_> {
                 }
                 ContractRequest::Subscribe { key, .. } => write!(f, "subscribe request for {key}"),
             },
-            ClientRequest::DelegateOp(_op) => write!(f, "component request"),
+            ClientRequest::DelegateOp(_op) => write!(f, "delegate request"),
             ClientRequest::Disconnect { .. } => write!(f, "client disconnected"),
             ClientRequest::GenerateRandData { bytes } => write!(f, "generate {bytes} random bytes"),
         }
@@ -346,7 +412,7 @@ impl std::fmt::Display for HostResponse {
                     f.write_fmt(format_args!("update notification (key: {key})"))
                 }
             },
-            HostResponse::DelegateResponse { .. } => write!(f, "component responses"),
+            HostResponse::DelegateResponse { .. } => write!(f, "delegate responses"),
             HostResponse::Ok => write!(f, "ok response"),
             HostResponse::GenerateRandData(_) => write!(f, "random bytes"),
         }
@@ -357,6 +423,7 @@ impl std::fmt::Display for HostResponse {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum ContractResponse<T = WrappedState> {
     GetResponse {
+        key: ContractKey,
         contract: Option<ContractContainer>,
         #[serde(bound(deserialize = "T: DeserializeOwned"))]
         state: T,

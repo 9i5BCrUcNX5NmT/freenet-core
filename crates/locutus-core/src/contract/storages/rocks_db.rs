@@ -57,9 +57,19 @@ impl StateStorage for RocksDb {
         key: &ContractKey,
     ) -> Result<Option<locutus_runtime::WrappedState>, Self::Error> {
         match self.0.get([key.bytes(), RocksDb::STATE_SUFFIX].concat()) {
-            Ok(result) => Ok(result
-                .map(|r| Some(WrappedState::new(r)))
-                .expect("vec bytes")),
+            Ok(result) => {
+                if let Some(r) = result.map(|r| Some(WrappedState::new(r))) {
+                    Ok(r)
+                } else {
+                    tracing::debug!(
+                        "failed getting contract: `{key}` {}",
+                        key.encoded_code_hash()
+                            .map(|ch| format!("(with code hash: `{ch}`)"))
+                            .unwrap_or(String::new())
+                    );
+                    Ok(None)
+                }
+            }
             Err(e) => {
                 if rocksdb::ErrorKind::NotFound == e.kind() {
                     Ok(None)
@@ -211,7 +221,12 @@ where
                         fetch_contract,
                     } => {
                         let (state, contract) = self.get_contract(&key, fetch_contract).await?;
-                        Ok(ContractResponse::GetResponse { contract, state }.into())
+                        Ok(ContractResponse::GetResponse {
+                            key,
+                            contract,
+                            state,
+                        }
+                        .into())
                     }
                     ContractRequest::Put {
                         contract,

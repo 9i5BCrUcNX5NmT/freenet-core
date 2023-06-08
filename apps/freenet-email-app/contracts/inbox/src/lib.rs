@@ -1,27 +1,49 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Verifier};
 use locutus_aft_interface::{Tier, TokenAllocationRecord, TokenAssignment, TokenAssignmentHash};
 use locutus_stdlib::prelude::{blake2::Digest, *};
+use rsa::{
+    pkcs1v15::{SigningKey, VerifyingKey},
+    sha2::Sha256,
+    signature::{Signer, Verifier},
+    RsaPrivateKey, RsaPublicKey,
+};
 use serde::{Deserialize, Serialize};
 
+/// Sign this byte array and include the signature in the `inbox_signature` so this inbox can be verified on updates.
+const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
+
 #[derive(Serialize, Deserialize)]
-struct InboxParams {
+pub struct InboxParams {
     // The public key of the inbox owner message.
-    pub_key: ed25519_dalek::PublicKey,
+    pub pub_key: RsaPublicKey,
+}
+
+impl TryFrom<InboxParams> for Parameters<'_> {
+    type Error = serde_json::Error;
+
+    fn try_from(value: InboxParams) -> Result<Self, Self::Error> {
+        serde_json::to_vec(&value).map(Into::into)
+    }
 }
 
 impl TryFrom<Parameters<'static>> for InboxParams {
     type Error = ContractError;
     fn try_from(params: Parameters<'static>) -> Result<Self, Self::Error> {
-        bincode::deserialize(params.as_ref()).map_err(|err| ContractError::Deser(format!("{err}")))
+        serde_json::from_slice(params.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))
     }
 }
 
+type Signature = Box<[u8]>;
+
 #[derive(Serialize, Deserialize)]
-enum UpdateInbox {
-    AddMessages(Vec<Message>),
+pub enum UpdateInbox {
+    AddMessages {
+        messages: Vec<Message>,
+    },
     RemoveMessages {
         signature: Signature,
         ids: Vec<TokenAssignmentHash>,
@@ -32,15 +54,17 @@ enum UpdateInbox {
     },
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct InboxSettings {
-    minimum_tier: Tier,
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct InboxSettings {
+    pub minimum_tier: Tier,
+    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::default")]
+    pub private: EncryptedContent,
 }
 
 impl TryFrom<StateDelta<'static>> for UpdateInbox {
     type Error = ContractError;
     fn try_from(state: StateDelta<'static>) -> Result<Self, Self::Error> {
-        bincode::deserialize(&state).map_err(|err| ContractError::Deser(format!("{err}")))
+        serde_json::from_slice(&state).map_err(|err| ContractError::Deser(format!("{err}")))
     }
 }
 
@@ -48,19 +72,18 @@ impl TryFrom<StateDelta<'static>> for UpdateInbox {
 /// The inbox contract does not need to be aware of the content.
 type EncryptedContent = Vec<u8>;
 
-#[derive(Serialize, Deserialize)]
-struct Message {
-    title: EncryptedContent,
-    content: EncryptedContent,
-    token_assignment: TokenAssignment,
-    time: DateTime<Utc>,
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Message {
+    pub content: EncryptedContent,
+    pub token_assignment: TokenAssignment,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Inbox {
-    messages: Vec<Message>,
-    last_update: DateTime<Utc>,
-    settings: InboxSettings,
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Inbox {
+    pub messages: Vec<Message>,
+    pub last_update: DateTime<Utc>,
+    pub settings: InboxSettings,
+    inbox_signature: Signature,
 }
 
 enum VerificationError {
@@ -68,15 +91,73 @@ enum VerificationError {
     TokenAssignmentMismatch,
     InvalidInboxKey,
     InvalidMessageHash,
+    WrongSignature,
+}
+
+impl From<VerificationError> for ContractError {
+    fn from(_err: VerificationError) -> Self {
+        ContractError::InvalidUpdate
+    }
+}
+
+impl Display for VerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerificationError::MissingContracts(ids) => {
+                write!(f, "Missing contracts: {:?}", ids)
+            }
+            VerificationError::TokenAssignmentMismatch => {
+                write!(f, "Token assignment mismatch")
+            }
+            VerificationError::InvalidInboxKey => {
+                write!(f, "Invalid inbox key")
+            }
+            VerificationError::InvalidMessageHash => {
+                write!(f, "Invalid message hash")
+            }
+            VerificationError::WrongSignature => {
+                write!(f, "Wrong signature")
+            }
+        }
+    }
 }
 
 impl Inbox {
+    #[cfg(feature = "wasmbind")]
+    pub fn new(key: &RsaPrivateKey, settings: InboxSettings, messages: Vec<Message>) -> Self {
+        let inbox_signature = Self::sign(key);
+        Self {
+            settings,
+            messages,
+            last_update: Utc::now(),
+            inbox_signature,
+        }
+    }
+
+    pub fn sign(key: &RsaPrivateKey) -> Signature {
+        let signing_key = SigningKey::<Sha256>::new_with_prefix(key.clone());
+        signing_key.sign(STATE_UPDATE).into()
+    }
+
+    fn verify(&self, params: &InboxParams) -> Result<(), VerificationError> {
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(params.pub_key.clone());
+        verifying_key
+            .verify(
+                STATE_UPDATE,
+                &rsa::pkcs1v15::Signature::from(self.inbox_signature.clone()),
+            )
+            .map_err(|_e| VerificationError::WrongSignature)?;
+        Ok(())
+    }
+
     fn add_messages(
         &mut self,
         params: &InboxParams,
         allocation_records: &HashMap<ContractInstanceId, TokenAllocationRecord>,
         messages: Vec<Message>,
     ) -> Result<(), VerificationError> {
+        // FIXME: make sure we are not re-adding old messages by verifying the time is more recent
+        // than last updated
         for message in messages {
             let records = allocation_records
                 .get(&message.token_assignment.token_record)
@@ -87,7 +168,6 @@ impl Inbox {
                 return Err(VerificationError::TokenAssignmentMismatch);
             }
             let mut hasher = blake2::Blake2s256::new();
-            // hasher.update(&message.title);
             hasher.update(&message.content);
             let hash = hasher.finalize();
             if message.token_assignment.assignment_hash != hash.as_slice() {
@@ -139,17 +219,6 @@ impl Inbox {
         Ok(())
     }
 
-    fn other_messages(&self, delta: Inbox) -> impl Iterator<Item = Message> + '_ {
-        let hashes: HashSet<_> = self
-            .messages
-            .iter()
-            .map(|m| &m.token_assignment.assignment_hash)
-            .collect();
-        delta.messages.into_iter().filter_map(move |m| {
-            (hashes.contains(&m.token_assignment.assignment_hash)).then_some(m)
-        })
-    }
-
     fn remove_messages(&mut self, messages: HashSet<TokenAssignmentHash>) {
         self.messages
             .retain(|m| !messages.contains(&m.token_assignment.assignment_hash));
@@ -165,9 +234,18 @@ impl Inbox {
                  }| token_assignment.assignment_hash,
             )
             .collect::<HashSet<_>>();
-        let serialized = bincode::serialize(&InboxSummary(messages))
+        let serialized = serde_json::to_vec(&InboxSummary(messages))
             .map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(StateSummary::from(serialized))
+    }
+
+    fn merge(&mut self, other: Self, params: &InboxParams) -> Result<(), ContractError> {
+        if self.messages.is_empty() && self.last_update < other.last_update {
+            for m in other.messages {
+                self.add_message(m, params)?;
+            }
+        }
+        Ok(())
     }
 
     fn delta(self, InboxSummary(messages): InboxSummary) -> Inbox {
@@ -180,14 +258,15 @@ impl Inbox {
             messages: delta,
             last_update: self.last_update,
             settings: self.settings,
+            inbox_signature: self.inbox_signature,
         }
     }
 }
 
-impl TryFrom<State<'static>> for Inbox {
+impl TryFrom<&'_ State<'static>> for Inbox {
     type Error = ContractError;
-    fn try_from(state: State<'static>) -> Result<Self, Self::Error> {
-        serde_json::from_slice(&state).map_err(|err| ContractError::Deser(format!("{err}")))
+    fn try_from(state: &State<'static>) -> Result<Self, Self::Error> {
+        serde_json::from_slice(state).map_err(|err| ContractError::Deser(format!("{err}")))
     }
 }
 
@@ -195,7 +274,7 @@ impl TryFrom<Inbox> for StateDelta<'static> {
     type Error = ContractError;
     fn try_from(value: Inbox) -> Result<Self, Self::Error> {
         let serialized =
-            bincode::serialize(&value).map_err(|err| ContractError::Deser(format!("{err}")))?;
+            serde_json::to_vec(&value).map_err(|err| ContractError::Deser(format!("{err}")))?;
         Ok(serialized.into())
     }
 }
@@ -210,17 +289,20 @@ impl TryFrom<StateSummary<'static>> for InboxSummary {
     }
 }
 
-fn can_remove_message<'a>(
+/// Whether this messages can be added/removed from the inbox.
+fn can_modify_inbox<'a>(
     params: &InboxParams,
     signature: &Signature,
     ids: impl Iterator<Item = &'a TokenAssignmentHash>,
 ) -> Result<(), ContractError> {
+    let mut signed = Vec::with_capacity(ids.size_hint().0 * 32);
     for hash in ids {
-        params
-            .pub_key
-            .verify(hash, signature)
-            .map_err(|_err| ContractError::InvalidUpdate)?;
+        signed.extend(hash);
     }
+    let verifying_key = VerifyingKey::<Sha256>::from(params.pub_key.clone());
+    verifying_key
+        .verify(signed.as_ref(), &signature.clone().into())
+        .map_err(|_err| ContractError::InvalidUpdate)?;
     Ok(())
 }
 
@@ -231,13 +313,14 @@ fn can_update_settings(
 ) -> Result<(), ContractError> {
     let serialized =
         serde_json::to_vec(settings).map_err(|e| ContractError::Deser(format!("{e}")))?;
-    params
-        .pub_key
-        .verify(&serialized, signature)
+    let verifying_key = VerifyingKey::<Sha256>::from(params.pub_key.clone());
+    verifying_key
+        .verify(&serialized, &signature.clone().into())
         .map_err(|_err| ContractError::InvalidUpdate)?;
     Ok(())
 }
 
+#[cfg(feature = "contract")]
 #[contract]
 impl ContractInterface for Inbox {
     fn validate_state(
@@ -245,8 +328,9 @@ impl ContractInterface for Inbox {
         state: State<'static>,
         related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        let inbox = Inbox::try_from(state)?;
+        let inbox = Inbox::try_from(&state)?;
         let params = InboxParams::try_from(parameters)?;
+        inbox.verify(&params)?;
 
         let mut missing_related = vec![];
         let mut allocation_records = HashMap::new();
@@ -284,9 +368,10 @@ impl ContractInterface for Inbox {
         state: State<'static>,
         updates: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        // todo: take care of race condition between token alloc record and the assignment
-        let mut inbox = Inbox::try_from(state)?;
+        // fixme: take care of race condition between token alloc record and the assignment
+        let mut inbox = Inbox::try_from(&state)?;
         let params = InboxParams::try_from(parameters)?;
+        inbox.verify(&params)?;
         let mut missing_related = vec![];
         let mut new_messages = vec![];
         let mut rm_messages = HashSet::new();
@@ -294,19 +379,18 @@ impl ContractInterface for Inbox {
         for update in updates {
             match update {
                 UpdateData::State(state) => {
-                    let delta_inbox = Inbox::try_from(state)?;
-                    let delta_messages = inbox.other_messages(delta_inbox);
-                    new_messages.extend(delta_messages);
+                    let full_inbox = Inbox::try_from(&state)?;
+                    inbox.merge(full_inbox, &params)?;
                 }
                 UpdateData::Delta(d) => match UpdateInbox::try_from(d)? {
-                    UpdateInbox::AddMessages(mut messages) => {
+                    UpdateInbox::AddMessages { mut messages } => {
                         for m in &messages {
                             missing_related.push(m.token_assignment.token_record);
                         }
                         new_messages.append(&mut messages);
                     }
                     UpdateInbox::RemoveMessages { signature, ids } => {
-                        can_remove_message(&params, &signature, ids.iter())?;
+                        can_modify_inbox(&params, &signature, ids.iter())?;
                         rm_messages.extend(ids);
                     }
                     UpdateInbox::ModifySettings {
@@ -317,36 +401,11 @@ impl ContractInterface for Inbox {
                         inbox.settings = settings;
                     }
                 },
-                UpdateData::StateAndDelta { state, delta } => {
-                    match UpdateInbox::try_from(delta)? {
-                        UpdateInbox::AddMessages(mut messages) => {
-                            for m in &messages {
-                                missing_related.push(m.token_assignment.token_record);
-                            }
-                            new_messages.append(&mut messages);
-                        }
-                        UpdateInbox::RemoveMessages { signature, ids } => {
-                            can_remove_message(&params, &signature, ids.iter())?;
-                            rm_messages.extend(ids);
-                        }
-                        UpdateInbox::ModifySettings {
-                            settings,
-                            signature,
-                        } => {
-                            can_update_settings(&params, &signature, &settings)?;
-                            inbox.settings = settings;
-                        }
-                    }
-                    let delta_inbox = Inbox::try_from(state)?;
-                    let delta_messages = inbox.other_messages(delta_inbox);
-                    new_messages.extend(delta_messages);
-                }
                 UpdateData::RelatedState { related_to, state } => {
                     let token_record = TokenAllocationRecord::try_from(state)?;
                     allocation_records.insert(related_to, token_record);
                 }
-                UpdateData::RelatedDelta { .. } => unreachable!(),
-                UpdateData::RelatedStateAndDelta { .. } => unreachable!(),
+                _ => unreachable!(),
             }
         }
 
@@ -363,9 +422,10 @@ impl ContractInterface for Inbox {
         if missing_related.is_empty() {
             inbox
                 .add_messages(&params, &allocation_records, new_messages)
-                .map_err(|_| ContractError::InvalidUpdate)?;
+                .map_err(|err| ContractError::Other(format!("{err}")))?;
             inbox.remove_messages(rm_messages);
-            inbox.last_update = locutus_stdlib::time::now();
+            // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want
+            //inbox.last_update = locutus_stdlib::time::now();
             let serialized =
                 serde_json::to_vec(&inbox).map_err(|err| ContractError::Deser(format!("{err}")))?;
             Ok(UpdateModification::valid(serialized.into()))
@@ -378,7 +438,7 @@ impl ContractInterface for Inbox {
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        let inbox = Inbox::try_from(state)?;
+        let inbox = Inbox::try_from(&state)?;
         inbox.summarize()
     }
 
@@ -387,9 +447,64 @@ impl ContractInterface for Inbox {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let inbox = Inbox::try_from(state)?;
+        // wrong summary representations
+        let inbox = Inbox::try_from(&state)?;
         let summary = InboxSummary::try_from(summary)?;
         let delta = inbox.delta(summary);
         delta.try_into()
+    }
+}
+
+#[cfg(all(feature = "contract", test))]
+mod tests {
+    use super::*;
+    use rsa::{pkcs1::DecodeRsaPrivateKey, Pkcs1v15Sign, RsaPrivateKey};
+
+    #[test]
+    fn validate_test() -> Result<(), Box<dyn std::error::Error>> {
+        let private_key = RsaPrivateKey::from_pkcs1_pem(include_str!(
+            "../../../web/examples/rsa4096-id-1-priv.pem"
+        ))
+        .unwrap();
+        let public_key = private_key.to_public_key();
+
+        let params: Parameters = InboxParams {
+            pub_key: public_key.clone(),
+        }
+        .try_into()
+        .map_err(|e| format!("{e}"))
+        .unwrap();
+
+        let digest = Sha256::digest(STATE_UPDATE).to_vec();
+        let signature = private_key
+            .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+            .unwrap();
+
+        let state_bytes = format!(
+            r#"{{
+            "messages": [],
+            "last_update": "2022-05-10T00:00:00Z",
+            "settings": {{
+                "minimum_tier": "Day1",
+                "private": []
+            }},
+            "inbox_signature": {}
+        }}"#,
+            serde_json::to_string(&signature).unwrap()
+        )
+        .as_bytes()
+        .to_vec();
+
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(public_key);
+        let sign = &rsa::pkcs1v15::Signature::try_from(signature.as_slice()).unwrap();
+
+        match verifying_key.verify(STATE_UPDATE, sign) {
+            Ok(_) => println!("successful verification"),
+            Err(e) => println!("verification error: {:?}", e),
+        };
+
+        let is_valid = Inbox::validate_state(params, State::from(state_bytes), Default::default())?;
+        assert!(is_valid == ValidateResult::Valid);
+        Ok(())
     }
 }

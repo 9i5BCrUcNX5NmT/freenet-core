@@ -5,15 +5,13 @@ use std::collections::HashMap;
 use blake2::digest::generic_array::GenericArray;
 use locutus_runtime::prelude::*;
 use locutus_stdlib::client_api::{
-    ClientError, ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse,
+    ClientError, ClientRequest, ContractError as CoreContractError, ContractRequest,
+    ContractResponse, DelegateError as CoreDelegateError, DelegateRequest, HostResponse,
+    RequestError,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{
-    client_events::{ContractError as CoreContractError, DelegateError as CoreDelegateError},
-    either::Either,
-    ClientId, DynError, HostResult, RequestError, Storage,
-};
+use crate::{either::Either, ClientId, DynError, HostResult, Storage};
 
 type Response = Result<HostResponse, Either<RequestError, DynError>>;
 
@@ -25,7 +23,7 @@ pub enum OperationMode {
     Network,
 }
 
-/// A WASM executor which will run any contracts, components, etc. registered.
+/// A WASM executor which will run any contracts, delegates, etc. registered.
 ///
 /// This executor will monitor the store directories and databases to detect state changes.
 /// Consumers of the executor are required to poll for new changes in order to be notified
@@ -35,12 +33,14 @@ pub struct Executor {
     runtime: Runtime,
     contract_state: StateStore<Storage>,
     update_notifications: HashMap<ContractKey, Vec<(ClientId, UnboundedSender<HostResult>)>>,
-    subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, StateSummary<'static>>>,
+    subscriber_summaries: HashMap<ContractKey, HashMap<ClientId, Option<StateSummary<'static>>>>,
 }
 
 impl Executor {
     pub async fn new(
-        store: ContractStore,
+        contract_store: ContractStore,
+        delegate_store: DelegateStore,
+        secret_store: SecretsStore,
         contract_state: StateStore<Storage>,
         ctrl_handler: impl FnOnce(),
         mode: OperationMode,
@@ -49,13 +49,7 @@ impl Executor {
 
         Ok(Self {
             mode,
-            runtime: Runtime::build(
-                store,
-                DelegateStore::default(),
-                SecretsStore::default(),
-                false,
-            )
-            .unwrap(),
+            runtime: Runtime::build(contract_store, delegate_store, secret_store, false).unwrap(),
             contract_state,
             update_notifications: HashMap::default(),
             subscriber_summaries: HashMap::default(),
@@ -67,13 +61,16 @@ impl Executor {
         key: ContractKey,
         cli_id: ClientId,
         notification_ch: tokio::sync::mpsc::UnboundedSender<HostResult>,
-        summary: StateSummary<'static>,
-    ) -> Result<(), DynError> {
+        summary: Option<StateSummary<'_>>,
+    ) -> Result<(), RequestError> {
         let channels = self.update_notifications.entry(key.clone()).or_default();
         if let Ok(i) = channels.binary_search_by_key(&&cli_id, |(p, _)| p) {
             let (_, existing_ch) = &channels[i];
             if !existing_ch.same_channel(&notification_ch) {
-                return Err(format!("peer {cli_id} has multiple notification channels").into());
+                return Err(RequestError::from(CoreContractError::Subscribe {
+                    key,
+                    cause: format!("Peer {cli_id} already subscribed"),
+                }));
             }
         } else {
             channels.push((cli_id, notification_ch));
@@ -83,7 +80,7 @@ impl Executor {
             .subscriber_summaries
             .entry(key.clone())
             .or_default()
-            .insert(cli_id, summary)
+            .insert(cli_id, summary.map(StateSummary::into_owned))
             .is_some()
         {
             tracing::warn!(
@@ -128,7 +125,7 @@ impl Executor {
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_op(op, id, updates).await,
-            ClientRequest::DelegateOp(op) => self.component_op(op),
+            ClientRequest::DelegateOp(op) => self.delegate_op(op),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
@@ -250,28 +247,68 @@ impl Executor {
                         .map_err(Into::into)
                         .map_err(Either::Right)?
                         .clone();
-                    let update_modification = self
-                        .runtime
-                        .update_state(&key, &parameters, &state, &[data])
-                        .map_err(|err| match err {
-                            err if err.is_contract_exec_error() => Either::Left(
-                                CoreContractError::Update {
-                                    key: key.clone(),
-                                    cause: format!("{err}"),
+                    let mut retrieved_contracts = Vec::new();
+                    retrieved_contracts.push(data);
+                    loop {
+                        let update_modification = self
+                            .runtime
+                            .update_state(&key, &parameters, &state, &retrieved_contracts)
+                            .map_err(|err| match err {
+                                err if err.is_contract_exec_error() => Either::Left(
+                                    CoreContractError::Update {
+                                        key: key.clone(),
+                                        cause: format!("{err}"),
+                                    }
+                                    .into(),
+                                ),
+                                other => Either::Right(other.into()),
+                            })?;
+                        let UpdateModification {
+                            new_state, related, ..
+                        } = update_modification;
+                        if let Some(new_state) = new_state {
+                            let new_state = WrappedState::new(new_state.into_bytes());
+                            self.contract_state
+                                .store(key.clone(), new_state.clone(), None)
+                                .await
+                                .map_err(|err| Either::Right(err.into()))?;
+                            break new_state;
+                        } else if !related.is_empty() {
+                            // some required contracts are missing
+                            let required_contracts = related.len() + 1;
+                            for RelatedContract {
+                                contract_instance_id: id,
+                                mode,
+                            } in related
+                            {
+                                match self.contract_state.get(&id.into()).await {
+                                    Ok(state) => {
+                                        // in this case we are already subscribed to and are updating this contract,
+                                        // we can try first with the existing value
+                                        retrieved_contracts.push(UpdateData::RelatedState {
+                                            related_to: id,
+                                            state: state.into(),
+                                        });
+                                    }
+                                    Err(StateStoreError::MissingContract(_))
+                                        if self.mode == OperationMode::Network =>
+                                    {
+                                        // retrieve the contract from the network first in the mode the consumer contract informed the node
+                                        todo!("related mode updates subscription not implemented for type {mode:?}")
+                                    }
+                                    Err(other_err) => return Err(Either::Right(other_err.into())),
                                 }
-                                .into(),
-                            ),
-                            other => Either::Right(other.into()),
-                        })?;
-                    if let Some(new_state) = update_modification.new_state {
-                        let new_state = WrappedState::new(new_state.into_bytes());
-                        self.contract_state
-                            .store(key.clone(), new_state.clone(), None)
-                            .await
-                            .map_err(|err| Either::Right(err.into()))?;
-                        new_state
-                    } else {
-                        todo!()
+                            }
+                            if retrieved_contracts.len() == required_contracts {
+                                // try running again with all the related contracts retrieved
+                                continue;
+                            } else {
+                                todo!("keep waiting/trying until timeout?")
+                            }
+                        } else {
+                            // state wasn't updated
+                            break state;
+                        }
                     }
                 };
                 // in the network impl this would be sent over the network
@@ -291,11 +328,11 @@ impl Executor {
                 key,
                 fetch_contract: contract,
             } => self.perform_get(contract, key).await.map_err(Either::Left),
-            ContractRequest::Subscribe { key } => {
+            ContractRequest::Subscribe { key, summary } => {
                 let updates =
                     updates.ok_or_else(|| Either::Right("missing update channel".into()))?;
-                self.register_contract_notifier(key.clone(), id, updates, [].as_ref().into())
-                    .unwrap();
+                self.register_contract_notifier(key.clone(), id, updates, summary)
+                    .map_err(Either::Left)?;
                 tracing::info!("getting contract: {}", key.encoded_contract_id());
                 // by default a subscribe op has an implicit get
                 self.perform_get(true, key).await.map_err(Either::Left)
@@ -304,54 +341,59 @@ impl Executor {
         }
     }
 
-    fn component_op(&mut self, req: DelegateRequest<'_>) -> Response {
+    fn delegate_op(&mut self, req: DelegateRequest<'_>) -> Response {
         match req {
             DelegateRequest::RegisterDelegate {
-                component,
+                delegate,
                 cipher,
                 nonce,
             } => {
                 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-                let key = component.key().clone();
+                let key = delegate.key().clone();
 
                 let arr = GenericArray::from_slice(&cipher);
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = GenericArray::from_slice(&nonce).to_owned();
 
-                match self.runtime.register_component(component, cipher, nonce) {
+                match self.runtime.register_delegate(delegate, cipher, nonce) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::error!("failed registering component `{key}`: {err}");
+                        tracing::error!("failed registering delegate `{key}`: {err}");
                         Err(Either::Left(CoreDelegateError::RegisterError(key).into()))
                     }
                 }
             }
             DelegateRequest::UnregisterDelegate(key) => {
-                match self.runtime.unregister_component(&key) {
+                match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
-                        tracing::error!("failed unregistering component `{key}`: {err}");
+                        tracing::error!("failed unregistering delegate `{key}`: {err}");
                         Ok(HostResponse::Ok)
                     }
                 }
             }
-            DelegateRequest::ApplicationMessages { key, inbound } => {
+            DelegateRequest::ApplicationMessages {
+                key,
+                inbound,
+                params,
+            } => {
                 match self.runtime.inbound_app_message(
                     &key,
+                    &params,
                     inbound
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)
                         .collect(),
                 ) {
                     Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-                    Err(err) if err.is_component_exec_error() => {
-                        tracing::error!("failed processing messages for component `{key}`: {err}");
+                    Err(err) if err.is_delegate_exec_error() => {
+                        tracing::error!("failed processing messages for delegate `{key}`: {err}");
                         Err(Either::Left(
                             CoreDelegateError::ExecutionError(format!("{err}")).into(),
                         ))
                     }
                     Err(err) => {
-                        tracing::error!("failed executing component `{key}`: {err}");
+                        tracing::error!("failed executing delegate `{key}`: {err}");
                         Ok(HostResponse::Ok)
                     }
                 }
@@ -369,26 +411,43 @@ impl Executor {
             let summaries = self.subscriber_summaries.get_mut(key).unwrap();
             for (peer_key, notifier) in notifiers {
                 let peer_summary = summaries.get_mut(peer_key).unwrap();
-                let update = self
-                    .runtime
-                    .get_state_delta(key, params, new_state, &*peer_summary)
-                    .map_err(|err| match err {
-                        err if err.is_contract_exec_error() => Either::Left(
-                            CoreContractError::Put {
+                let update = match peer_summary {
+                    Some(summary) => self
+                        .runtime
+                        .get_state_delta(key, params, new_state, &*summary)
+                        .map_err(|err| {
+                            tracing::error!("{err}");
+                            match err {
+                                err if err.is_contract_exec_error() => Either::Left(
+                                    CoreContractError::Put {
+                                        key: key.clone(),
+                                        cause: format!("{err}"),
+                                    }
+                                    .into(),
+                                ),
+                                other => Either::Right(other.into()),
+                            }
+                        })?
+                        .to_owned()
+                        .into(),
+                    None => UpdateData::State(State::from(new_state.as_ref()).into_owned()),
+                };
+                notifier
+                    .send(Ok(ContractResponse::UpdateNotification {
+                        key: key.clone(),
+                        update,
+                    }
+                    .into()))
+                    .map_err(|err| {
+                        tracing::error!("{err}");
+                        Either::Left(
+                            CoreContractError::Update {
                                 key: key.clone(),
                                 cause: format!("{err}"),
                             }
                             .into(),
-                        ),
-                        other => Either::Right(other.into()),
+                        )
                     })?;
-                notifier
-                    .send(Ok(ContractResponse::UpdateNotification {
-                        key: key.clone(),
-                        update: update.to_owned().into(),
-                    }
-                    .into()))
-                    .unwrap();
             }
         }
         Ok(())
@@ -422,11 +481,12 @@ impl Executor {
         }
         match self.contract_state.get(&key).await {
             Ok(state) => Ok(ContractResponse::GetResponse {
+                key,
                 contract: got_contract,
                 state,
             }
             .into()),
-            Err(StateStoreError::MissingContract) => Err(CoreContractError::Get {
+            Err(StateStoreError::MissingContract(_)) => Err(CoreContractError::Get {
                 key,
                 cause: "missing contract state".into(),
             }
@@ -455,6 +515,8 @@ mod test {
         let mut counter = 0;
         Executor::new(
             contract_store,
+            DelegateStore::default(),
+            SecretsStore::default(),
             state_store,
             || {
                 counter += 1;

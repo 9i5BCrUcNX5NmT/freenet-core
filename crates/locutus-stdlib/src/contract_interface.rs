@@ -18,9 +18,16 @@ use std::{
 };
 
 use blake2::{Blake2s256, Digest};
-use byteorder::LittleEndian;
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
+use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
+
+use crate::{
+    client_api::{TryFromTsStd, WsApiError},
+    code_hash::CodeHash,
+    parameters::Parameters,
+};
 
 const CONTRACT_KEY_SIZE: usize = 32;
 
@@ -37,26 +44,6 @@ pub enum ContractError {
     InvalidDelta,
     #[error("{0}")]
     Other(String),
-}
-
-pub trait TryFromTsStd<T>: Sized {
-    fn try_decode(value: T) -> Result<Self, WsApiError>;
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum WsApiError {
-    #[error("Failed decoding msgpack message from client request: {cause}")]
-    MsgpackDecodeError { cause: String },
-    #[error("Unsupported contract version")]
-    UnsupportedContractVersion,
-    #[error("Failed unpacking contract container")]
-    UnpackingContractContainerError(Box<dyn std::error::Error + Send + Sync + 'static>),
-}
-
-impl WsApiError {
-    pub fn deserialization(cause: String) -> Self {
-        Self::MsgpackDecodeError { cause }
-    }
 }
 
 /// An update to a contract state or any required related contracts to update that state.
@@ -479,6 +466,7 @@ pub struct Contract<'a> {
     pub parameters: Parameters<'a>,
     #[serde(borrow)]
     pub data: ContractCode<'a>,
+    // todo: skip serializing and instead compute it
     key: ContractKey,
 }
 
@@ -508,7 +496,6 @@ impl TryFrom<Vec<u8>> for Contract<'static> {
     type Error = std::io::Error;
 
     fn try_from(data: Vec<u8>) -> Result<Self, Self::Error> {
-        use byteorder::ReadBytesExt;
         let mut reader = Cursor::new(data);
 
         let params_len = reader.read_u64::<LittleEndian>()?;
@@ -571,65 +558,6 @@ impl<'a> arbitrary::Arbitrary<'a> for Contract<'static> {
             parameters,
             key,
         })
-    }
-}
-
-/// Data that forms part of a contract along with the WebAssembly code.
-///
-/// This is supplied to the contract as a parameter to the contract's functions. Parameters are
-/// typically be used to configure a contract, much like the parameters of a constructor function.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde_as]
-#[cfg_attr(feature = "testing", derive(arbitrary::Arbitrary))]
-pub struct Parameters<'a>(
-    #[serde_as(as = "serde_with::Bytes")]
-    #[serde(borrow)]
-    Cow<'a, [u8]>,
-);
-
-impl<'a> Parameters<'a> {
-    /// Gets the number of bytes of data stored in the `Parameters`.
-    pub fn size(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Returns the bytes of parameters.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0.into_owned()
-    }
-
-    /// Copies the data if not owned and returns an owned version of self.
-    pub fn into_owned(self) -> Parameters<'static> {
-        let data: Cow<'static, _> = Cow::from(self.0.into_owned());
-        Parameters(data)
-    }
-}
-
-impl<'a> From<Vec<u8>> for Parameters<'a> {
-    fn from(data: Vec<u8>) -> Self {
-        Parameters(Cow::from(data))
-    }
-}
-
-impl<'a> From<&'a [u8]> for Parameters<'a> {
-    fn from(s: &'a [u8]) -> Self {
-        Parameters(Cow::from(s))
-    }
-}
-
-impl<'a> TryFromTsStd<&'a rmpv::Value> for Parameters<'a> {
-    fn try_decode(value: &'a rmpv::Value) -> Result<Self, WsApiError> {
-        let params = value.as_slice().unwrap();
-        Ok(Parameters::from(params))
-    }
-}
-
-impl<'a> AsRef<[u8]> for Parameters<'a> {
-    fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            Cow::Borrowed(arr) => arr,
-            Cow::Owned(arr) => arr.as_ref(),
-        }
     }
 }
 
@@ -779,7 +707,7 @@ impl<'a> DerefMut for StateDelta<'a> {
 /// between two contracts as part of the state synchronization mechanism. The format of a state
 /// summary is determined by the state's contract.
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct StateSummary<'a>(
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
@@ -855,19 +783,67 @@ pub struct ContractCode<'a> {
     #[serde_as(as = "serde_with::Bytes")]
     #[serde(borrow)]
     data: Cow<'a, [u8]>,
-    #[serde_as(as = "[_; CONTRACT_KEY_SIZE]")]
-    key: [u8; CONTRACT_KEY_SIZE],
+    // todo: skip serializing and instead compute it
+    hash: CodeHash,
+}
+
+impl ContractCode<'static> {
+    /// Loads contract code which has been versioned from the fs.
+    pub fn load_versioned(path: &Path) -> Result<(Self, Version), std::io::Error> {
+        const VERSION_0_0_1: Version = Version::new(0, 0, 1);
+
+        let mut contract_data = Cursor::new(Self::load_bytes(path)?);
+
+        // Get contract version
+        let version_size = contract_data
+            .read_u32::<BigEndian>()
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let mut version_data = vec![0; version_size as usize];
+        contract_data
+            .read_exact(&mut version_data)
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let version: Version = serde_json::from_slice(version_data.as_slice())
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+
+        if version == VERSION_0_0_1 {
+            let mut code_hash = [0u8; 32];
+            contract_data.read_exact(&mut code_hash)?;
+        }
+
+        // Get Contract code
+        let mut code_data: Vec<u8> = vec![];
+        contract_data
+            .read_to_end(&mut code_data)
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        Ok((ContractCode::from(code_data), version))
+    }
+
+    pub fn load_raw(path: &Path) -> Result<Self, std::io::Error> {
+        let contract_data = Self::load_bytes(path)?;
+        Ok(ContractCode::from(contract_data))
+    }
+
+    fn load_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+        let mut contract_file = File::open(path)?;
+        let mut contract_data = if let Ok(md) = contract_file.metadata() {
+            Vec::with_capacity(md.len() as usize)
+        } else {
+            Vec::new()
+        };
+        contract_file.read_to_end(&mut contract_data)?;
+        Ok(contract_data)
+    }
 }
 
 impl ContractCode<'_> {
     /// Contract key hash.
-    pub fn hash(&self) -> &[u8; CONTRACT_KEY_SIZE] {
-        &self.key
+    pub fn hash(&self) -> &CodeHash {
+        &self.hash
     }
 
     /// Returns the `Base58` string representation of the contract key.
     pub fn hash_str(&self) -> String {
-        Self::encode_hash(&self.key)
+        Self::encode_hash(&self.hash.0)
     }
 
     /// Reference to contract code.
@@ -891,37 +867,58 @@ impl ContractCode<'_> {
     pub fn into_owned(self) -> ContractCode<'static> {
         ContractCode {
             data: self.data.into_owned().into(),
-            key: self.key,
+            hash: self.hash,
         }
     }
 
-    fn gen_key(data: &[u8]) -> [u8; CONTRACT_KEY_SIZE] {
+    fn gen_hash(data: &[u8]) -> CodeHash {
         let mut hasher = Blake2s256::new();
         hasher.update(data);
         let key_arr = hasher.finalize();
         debug_assert_eq!(key_arr[..].len(), CONTRACT_KEY_SIZE);
         let mut key = [0; CONTRACT_KEY_SIZE];
         key.copy_from_slice(&key_arr);
-        key
+        CodeHash(key)
+    }
+
+    pub fn to_bytes_versioned(
+        &self,
+        version: &Version,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        match version {
+            ver if ver == &Version::new(0, 0, 1) => {
+                let mut serialized_version = serde_json::to_vec(&ver)
+                    .map_err(|e| format!("couldn't serialize contract version: {e}"))?;
+                let output_size =
+                    std::mem::size_of::<u32>() + serialized_version.len() + self.data().len();
+                let mut output: Vec<u8> = Vec::with_capacity(output_size);
+                output.write_u32::<BigEndian>(serialized_version.len() as u32)?;
+                output.append(&mut serialized_version);
+                output.extend(self.hash.0.iter());
+                output.extend(self.data());
+                Ok(output)
+            }
+            _ => panic!("version not supported"),
+        }
     }
 }
 
 impl From<Vec<u8>> for ContractCode<'static> {
     fn from(data: Vec<u8>) -> Self {
-        let key = ContractCode::gen_key(&data);
+        let key = ContractCode::gen_hash(&data);
         ContractCode {
             data: Cow::from(data),
-            key,
+            hash: key,
         }
     }
 }
 
 impl<'a> From<&'a [u8]> for ContractCode<'a> {
     fn from(data: &'a [u8]) -> ContractCode {
-        let key = ContractCode::gen_key(data);
+        let hash = ContractCode::gen_hash(data);
         ContractCode {
             data: Cow::from(data),
-            key,
+            hash,
         }
     }
 }
@@ -935,7 +932,7 @@ impl<'a> TryFromTsStd<&'a rmpv::Value> for ContractCode<'a> {
 
 impl PartialEq for ContractCode<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.hash == other.hash
     }
 }
 
@@ -952,7 +949,7 @@ impl<'a> arbitrary::Arbitrary<'a> for ContractCode<'static> {
 impl std::fmt::Display for ContractCode<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Contract( key: ")?;
-        internal_fmt_key(&self.key, f)?;
+        internal_fmt_key(&self.hash.0, f)?;
         let data: String = if self.data.len() > 8 {
             self.data[..4]
                 .iter()
@@ -1037,8 +1034,7 @@ impl Display for ContractInstanceId {
 )]
 pub struct ContractKey {
     instance: ContractInstanceId,
-    #[serde_as(as = "Option<[_; CONTRACT_KEY_SIZE]>")]
-    code: Option<[u8; CONTRACT_KEY_SIZE]>,
+    code: Option<CodeHash>,
 }
 
 impl PartialEq for ContractKey {
@@ -1062,6 +1058,12 @@ impl From<ContractInstanceId> for ContractKey {
     }
 }
 
+impl From<ContractKey> for ContractInstanceId {
+    fn from(key: ContractKey) -> Self {
+        key.instance
+    }
+}
+
 impl<'a, T, U> From<(T, U)> for ContractKey
 where
     T: Borrow<Parameters<'a>>,
@@ -1070,10 +1072,10 @@ where
     fn from(val: (T, U)) -> Self {
         let (parameters, code_data) = (val.0.borrow(), val.1.borrow());
         let id = generate_id(parameters, code_data);
-        let contract_hash = code_data.hash();
+        let code_hash = code_data.hash();
         Self {
             instance: id,
-            code: Some(*contract_hash),
+            code: Some(code_hash.clone()),
         }
     }
 }
@@ -1094,32 +1096,32 @@ impl ContractKey {
     }
 
     /// Returns the hash of the contract code only, if the key is fully specified.
-    pub fn code_hash(&self) -> Option<&[u8; CONTRACT_KEY_SIZE]> {
+    pub fn code_hash(&self) -> Option<&CodeHash> {
         self.code.as_ref()
     }
 
     /// Returns the encoded hash of the contract code, if the key is fully specified.
     pub fn encoded_code_hash(&self) -> Option<String> {
         self.code.as_ref().map(|c| {
-            bs58::encode(c)
+            bs58::encode(c.0)
                 .with_alphabet(bs58::Alphabet::BITCOIN)
                 .into_string()
         })
     }
 
-    /// Returns the decoded contract key from encoded hash of the contract key and the given
+    /// Returns the contract key from the encoded hash of the contract code and the given
     /// parameters.
-    pub fn decode(
-        contract_key: impl Into<String>,
+    pub fn from_params(
+        code_hash: impl Into<String>,
         parameters: Parameters,
     ) -> Result<Self, bs58::decode::Error> {
-        let mut contract = [0; CONTRACT_KEY_SIZE];
-        bs58::decode(contract_key.into())
+        let mut code_key = [0; CONTRACT_KEY_SIZE];
+        bs58::decode(code_hash.into())
             .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into(&mut contract)?;
+            .into(&mut code_key)?;
 
         let mut hasher = Blake2s256::new();
-        hasher.update(contract);
+        hasher.update(code_key);
         hasher.update(parameters.as_ref());
         let full_key_arr = hasher.finalize();
 
@@ -1127,13 +1129,17 @@ impl ContractKey {
         spec.copy_from_slice(&full_key_arr);
         Ok(Self {
             instance: ContractInstanceId(spec),
-            code: Some(contract),
+            code: Some(CodeHash(code_key)),
         })
     }
 
     /// Returns the `Base58` encoded string of the [`ContractInstanceId`](ContractInstanceId).
     pub fn encoded_contract_id(&self) -> String {
         self.instance.encode()
+    }
+
+    pub fn id(&self) -> ContractInstanceId {
+        self.instance
     }
 }
 
@@ -1186,7 +1192,7 @@ fn generate_id<'a>(
     let contract_hash = code_data.hash();
 
     let mut hasher = Blake2s256::new();
-    hasher.update(contract_hash);
+    hasher.update(contract_hash.0);
     hasher.update(parameters.as_ref());
     let full_key_arr = hasher.finalize();
 
@@ -1249,6 +1255,12 @@ impl From<Vec<u8>> for WrappedState {
     }
 }
 
+impl From<&'_ [u8]> for WrappedState {
+    fn from(bytes: &[u8]) -> Self {
+        Self::new(bytes.to_owned())
+    }
+}
+
 impl TryFromTsStd<&rmpv::Value> for WrappedState {
     fn try_decode(value: &rmpv::Value) -> Result<Self, WsApiError> {
         let state = value.as_slice().unwrap().to_vec();
@@ -1273,6 +1285,15 @@ impl Deref for WrappedState {
 impl Borrow<[u8]> for WrappedState {
     fn borrow(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl From<WrappedState> for State<'static> {
+    fn from(value: WrappedState) -> Self {
+        match Arc::try_unwrap(value.0) {
+            Ok(v) => State::from(v),
+            Err(v) => State::from(v.as_ref().to_vec()),
+        }
     }
 }
 
@@ -1339,17 +1360,6 @@ impl WrappedContract {
         &self.params
     }
 
-    pub fn get_data_from_fs(path: &Path) -> Result<ContractCode<'static>, std::io::Error> {
-        let mut contract_file = File::open(path)?;
-        let mut contract_data = if let Ok(md) = contract_file.metadata() {
-            Vec::with_capacity(md.len() as usize)
-        } else {
-            Vec::new()
-        };
-        contract_file.read_to_end(&mut contract_data)?;
-        Ok(ContractCode::from(contract_data))
-    }
-
     fn ser_contract_data<S>(data: &Arc<ContractCode<'_>>, ser: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -1357,13 +1367,12 @@ impl WrappedContract {
         data.serialize(ser)
     }
 
-    fn deser_contract_data<'de, D>(_deser: D) -> Result<Arc<ContractCode<'static>>, D::Error>
+    fn deser_contract_data<'de, D>(deser: D) -> Result<Arc<ContractCode<'static>>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
-        // Ok(Arc::new(data))
-        todo!()
+        let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
+        Ok(Arc::new(data.into_owned()))
     }
 
     fn ser_params<S>(data: &Parameters<'_>, ser: S) -> Result<S::Ok, S::Error>
@@ -1373,22 +1382,12 @@ impl WrappedContract {
         data.serialize(ser)
     }
 
-    fn deser_params<'de, D>(_deser: D) -> Result<Parameters<'static>, D::Error>
+    fn deser_params<'de, D>(deser: D) -> Result<Parameters<'static>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // let data: ContractCode<'de> = Deserialize::deserialize(deser)?;
-        // Ok(Arc::new(data))
-        todo!()
-    }
-}
-
-impl<'a> TryFrom<(&'a Path, Parameters<'static>)> for WrappedContract {
-    type Error = std::io::Error;
-    fn try_from(data: (&'a Path, Parameters<'static>)) -> Result<Self, Self::Error> {
-        let (path, params) = data;
-        let data = Arc::new(Self::get_data_from_fs(path)?);
-        Ok(WrappedContract::new(data, params))
+        let data: Parameters<'de> = Deserialize::deserialize(deser)?;
+        Ok(data.into_owned())
     }
 }
 
@@ -1713,7 +1712,7 @@ mod test {
         // let encoded_code = expected.contract_part_as_str();
         // println!("encoded key: {encoded_code}");
 
-        let decoded = ContractKey::decode(code.hash_str(), [].as_ref().into())?;
+        let decoded = ContractKey::from_params(code.hash_str(), [].as_ref().into())?;
         assert_eq!(expected, decoded);
         assert_eq!(expected.code_hash(), decoded.code_hash());
         Ok(())
