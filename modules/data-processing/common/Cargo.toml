@@ -1,0 +1,19 @@
+[package]
+name = "locutus-dataproc-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode = { workspace = true }
+bs58 = { workspace = true }
+chrono = { workspace = true }
+locutus-stdlib = { workspace = true }
+rsa = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { version = "0.24", features = ["derive"] }
+thiserror = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# FIXME: addign rand here pulls rand for transitive deps and gets included in the final wasm32 bin
+rand = "0.8"
