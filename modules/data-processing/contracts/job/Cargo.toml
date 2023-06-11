@@ -13,8 +13,9 @@ rsa = { version = "0.9.2", default-features = false, features = ["serde", "pem",
 ecdsa = { version = "0.16.6", default-features = false, features = ["serde", "pem", "sha2"] }
 p256 = "0.13.2"
 antiflood-tokens = { path = "../../../../modules/antiflood-tokens/interfaces", package = "locutus-aft-interface" }
-serde = "1"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
+common = { path = "../../common", package = "locutus-dataproc-common" }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

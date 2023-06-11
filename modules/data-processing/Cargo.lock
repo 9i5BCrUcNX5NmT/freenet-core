@@ -215,6 +215,7 @@ dependencies = [
  "chrono",
  "ecdsa",
  "locutus-aft-interface",
+ "locutus-dataproc-common",
  "locutus-stdlib",
  "p256",
  "rsa 0.9.2",
