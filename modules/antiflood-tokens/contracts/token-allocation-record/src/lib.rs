@@ -1,11 +1,10 @@
 use locutus_aft_interface::{
-    AllocationError, TokenAllocationRecord, TokenAllocationSummary, TokenAssignment,
-    TokenParameters,
+    AllocationError, InvalidReason, TokenAllocationRecord, TokenAssignment, TokenDelegateParameters,
 };
 use locutus_stdlib::prelude::*;
 use rsa::{pkcs1v15::VerifyingKey, sha2::Sha256};
 
-struct TokenAllocContract;
+pub struct TokenAllocContract;
 
 #[contract]
 impl ContractInterface for TokenAllocContract {
@@ -14,16 +13,15 @@ impl ContractInterface for TokenAllocContract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        let _assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let _params = TokenParameters::try_from(parameters)?;
-        // TODO: uncomment this when the validation is implemented
-        // for (_tier, assignments) in (&assigned_tokens).into_iter() {
-        //     for assignment in assignments {
-        //         if !assignment.is_valid(&params) {
-        //             return Ok(ValidateResult::Invalid);
-        //         }
-        //     }
-        // }
+        let assigned_tokens = TokenAllocationRecord::try_from(state)?;
+        let params = TokenDelegateParameters::try_from(parameters)?;
+        for (_tier, assignments) in (&assigned_tokens).into_iter() {
+            for assignment in assignments {
+                if assignment.is_valid(&params).is_err() {
+                    return Ok(ValidateResult::Invalid);
+                }
+            }
+        }
         Ok(ValidateResult::Valid)
     }
 
@@ -35,8 +33,8 @@ impl ContractInterface for TokenAllocContract {
         delta: StateDelta<'static>,
     ) -> Result<bool, ContractError> {
         let assigned_token = TokenAssignment::try_from(delta)?;
-        let params = TokenParameters::try_from(parameters)?;
-        Ok(assigned_token.is_valid(&params))
+        let params = TokenDelegateParameters::try_from(parameters)?;
+        Ok(assigned_token.is_valid(&params).is_ok())
     }
 
     fn update_state(
@@ -45,7 +43,7 @@ impl ContractInterface for TokenAllocContract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         let mut assigned_tokens = TokenAllocationRecord::try_from(state)?;
-        let params = TokenParameters::try_from(parameters)?;
+        let params = TokenDelegateParameters::try_from(parameters)?;
         for update in data {
             match update {
                 UpdateData::State(s) => {
@@ -54,7 +52,9 @@ impl ContractInterface for TokenAllocContract {
                         .merge(new_assigned_tokens, &params)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                 }
                 UpdateData::Delta(d) => {
@@ -63,7 +63,9 @@ impl ContractInterface for TokenAllocContract {
                         .append(new_assigned_token, &params)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                 }
                 UpdateData::StateAndDelta { state, delta } => {
@@ -72,14 +74,18 @@ impl ContractInterface for TokenAllocContract {
                         .merge(new_assigned_tokens, &params)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                     let new_assigned_token = TokenAssignment::try_from(delta)?;
                     assigned_tokens
                         .append(new_assigned_token, &params)
                         .map_err(|err| {
                             tracing::error!("{err}");
-                            ContractError::InvalidUpdate
+                            ContractError::InvalidUpdateWithInfo {
+                                reason: format!("{err}"),
+                            }
                         })?;
                 }
                 _ => unreachable!(),
@@ -112,36 +118,45 @@ impl ContractInterface for TokenAllocContract {
 }
 
 trait TokenAssignmentExt {
-    fn is_valid(&self, params: &TokenParameters) -> bool;
+    fn is_valid(&self, params: &TokenDelegateParameters) -> Result<(), InvalidReason>;
 }
 
 impl TokenAssignmentExt for TokenAssignment {
-    fn is_valid(&self, params: &TokenParameters) -> bool {
+    fn is_valid(&self, params: &TokenDelegateParameters) -> Result<(), InvalidReason> {
         use rsa::signature::Verifier;
         if !self.tier.is_valid_slot(self.time_slot) {
-            return false;
+            return Err(InvalidReason::InvalidSlot);
         }
-        let msg = TokenAssignment::signature_content(&self.time_slot, &self.assignee, self.tier);
+        let msg =
+            TokenAssignment::signature_content(&self.time_slot, self.tier, &self.assignment_hash);
         let verifying_key = VerifyingKey::<Sha256>::from(params.generator_public_key.clone());
         if verifying_key.verify(&msg, &self.signature).is_err() {
             // not signed by the private key of this generator
-            return false;
+            return Err(InvalidReason::SignatureMismatch);
         }
-        true
+        Ok(())
     }
 }
 
 trait TokenAllocationRecordExt {
-    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), AllocationError>;
+    fn merge(
+        &mut self,
+        other: Self,
+        params: &TokenDelegateParameters,
+    ) -> Result<(), AllocationError>;
     fn append(
         &mut self,
         assignment: TokenAssignment,
-        params: &TokenParameters,
+        params: &TokenDelegateParameters,
     ) -> Result<(), AllocationError>;
 }
 
 impl TokenAllocationRecordExt for TokenAllocationRecord {
-    fn merge(&mut self, other: Self, params: &TokenParameters) -> Result<(), AllocationError> {
+    fn merge(
+        &mut self,
+        other: Self,
+        params: &TokenDelegateParameters,
+    ) -> Result<(), AllocationError> {
         for (_, assignments) in other.into_iter() {
             for assignment in assignments {
                 self.append(assignment, params)?;
@@ -153,17 +168,18 @@ impl TokenAllocationRecordExt for TokenAllocationRecord {
     fn append(
         &mut self,
         assignment: TokenAssignment,
-        params: &TokenParameters,
+        params: &TokenDelegateParameters,
     ) -> Result<(), AllocationError> {
         match self.get_mut_tier(&assignment.tier) {
             Some(list) => {
                 if list.binary_search(&assignment).is_err() {
-                    if assignment.is_valid(params) {
-                        list.push(assignment);
-                        list.sort_unstable();
-                        Ok(())
-                    } else {
-                        Err(AllocationError::invalid_assignment(assignment))
+                    match assignment.is_valid(params) {
+                        Ok(_) => {
+                            list.push(assignment);
+                            list.sort_unstable();
+                            Ok(())
+                        }
+                        Err(err) => Err(AllocationError::invalid_assignment(assignment, err)),
                     }
                 } else {
                     Err(AllocationError::allocated_slot(&assignment))

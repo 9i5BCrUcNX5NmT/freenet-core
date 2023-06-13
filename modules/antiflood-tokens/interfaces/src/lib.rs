@@ -73,7 +73,6 @@ pub struct RequestNewToken {
     pub delegate_id: SecretsId,
     pub criteria: AllocationCriteria,
     pub records: TokenAllocationRecord,
-    pub assignee: Assignee,
     pub assignment_hash: AssignmentHash,
 }
 
@@ -220,7 +219,13 @@ impl Tier {
                     && time.nanosecond() == 0;
                 if !is_rounded {
                     let duration = chrono::Duration::from_std(self.tier_duration()).unwrap();
-                    time = time.with_second(0).unwrap().with_minute(0).unwrap();
+                    time = time
+                        .with_second(0)
+                        .unwrap()
+                        .with_minute(0)
+                        .unwrap()
+                        .with_hour(0)
+                        .unwrap();
                     time = time.trunc_subsecs(0);
                     time += duration;
                 }
@@ -280,7 +285,13 @@ impl Tier {
             && time.nanosecond() == 0
             && delta.num_days() % base_day == 0;
         if !is_rounded {
-            time = time.with_second(0).unwrap().with_minute(0).unwrap();
+            time = time
+                .with_second(0)
+                .unwrap()
+                .with_minute(0)
+                .unwrap()
+                .with_hour(0)
+                .unwrap();
             time = time.trunc_subsecs(0);
             let days_in_time = delta.num_days();
             let remainder_days = (days_in_time % base_day) as u32;
@@ -332,6 +343,10 @@ mod tier_tests {
 
     #[test]
     fn is_correct_day() {
+        let day1_tier = Tier::Day1;
+        assert!(day1_tier.is_valid_slot(get_date(2023, 1, 8)));
+        assert!(!day1_tier.is_valid_slot(get_date(2023, 1, 8).with_hour(12).unwrap()));
+
         let day7_tier = Tier::Day7;
         assert!(day7_tier.is_valid_slot(get_date(2023, 1, 7)));
         assert!(!day7_tier.is_valid_slot(get_date(2023, 1, 8)));
@@ -417,11 +432,11 @@ mod tier_tests {
 
 #[non_exhaustive]
 #[derive(Serialize, Deserialize)]
-pub struct TokenParameters {
+pub struct TokenDelegateParameters {
     pub generator_public_key: RsaPublicKey,
 }
 
-impl TokenParameters {
+impl TokenDelegateParameters {
     pub fn new(generator_public_key: RsaPublicKey) -> Self {
         Self {
             generator_public_key,
@@ -429,7 +444,7 @@ impl TokenParameters {
     }
 }
 
-impl TryFrom<Parameters<'_>> for TokenParameters {
+impl TryFrom<Parameters<'_>> for TokenDelegateParameters {
     type Error = ContractError;
     fn try_from(params: Parameters<'_>) -> Result<Self, Self::Error> {
         serde_json::from_slice(params.as_ref())
@@ -437,9 +452,9 @@ impl TryFrom<Parameters<'_>> for TokenParameters {
     }
 }
 
-impl TryFrom<TokenParameters> for Parameters<'static> {
+impl TryFrom<TokenDelegateParameters> for Parameters<'static> {
     type Error = serde_json::Error;
-    fn try_from(params: TokenParameters) -> Result<Self, Self::Error> {
+    fn try_from(params: TokenDelegateParameters) -> Result<Self, Self::Error> {
         serde_json::to_vec(&params).map(Into::into)
     }
 }
@@ -474,14 +489,23 @@ impl TryFrom<DelegateParameters> for Parameters<'static> {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum InvalidReason {
+    #[error("invalid slot")]
+    InvalidSlot,
+    #[error("invalid signature")]
+    SignatureMismatch,
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct AllocationError(Box<AllocationErrorInner>);
 
 impl AllocationError {
-    pub fn invalid_assignment(assignment: TokenAssignment) -> Self {
-        Self(Box::new(AllocationErrorInner::InvalidAssignment(
-            assignment,
-        )))
+    pub fn invalid_assignment(record: TokenAssignment, reason: InvalidReason) -> Self {
+        Self(Box::new(AllocationErrorInner::InvalidAssignment {
+            record,
+            reason,
+        }))
     }
 
     pub fn allocated_slot(assignment: &TokenAssignment) -> Self {
@@ -505,8 +529,11 @@ enum AllocationErrorInner {
     AllocatedSlot { tier: Tier, slot: DateTime<Utc> },
     #[error("the max age allowed is 730 days")]
     IncorrectMaxAge,
-    #[error("the following assignment is incorrect: {0}")]
-    InvalidAssignment(TokenAssignment),
+    #[error("the following assignment is incorrect: {record}, reason: {reason}")]
+    InvalidAssignment {
+        record: TokenAssignment,
+        reason: InvalidReason,
+    },
 }
 
 #[non_exhaustive]
@@ -691,7 +718,7 @@ impl TokenAllocationSummary {
                         return Some(());
                     }
                 }
-                return None;
+                None
             })
             .is_some()
     }
@@ -724,16 +751,16 @@ pub type TokenAssignmentHash = [u8; 32];
 pub struct TokenAssignment {
     pub tier: Tier,
     pub time_slot: DateTime<Utc>,
-    /// The assignment, the recipient decides whether this assignment is valid based on this field.
-    /// This will often be a public key.
-    pub assignee: Assignee,
+    /// The public key of the generator of this token, and by extension, the one who created the signature.
+    /// This field can be used tipically to verify, that the token has been indeed generated by this generator.
+    pub generator: Assignee,
     #[serde(with = "token_sig_ser")]
     /// `(tier, issue_time, assignee)` must be signed by `generator_public_key`
     pub signature: Signature,
     /// A Blake2s256 hash of the message.
     pub assignment_hash: TokenAssignmentHash,
     /// Key to the contract holding the token records of the assignee.
-    pub token_record: ContractInstanceId, // TODO: include this in the TokenAssignment itself
+    pub token_record: ContractInstanceId,
 }
 
 mod token_sig_ser {
@@ -760,25 +787,24 @@ mod token_sig_ser {
 impl TokenAssignment {
     const TIER_SIZE: usize = std::mem::size_of::<Tier>();
     const TS_SIZE: usize = std::mem::size_of::<i64>();
-    const ASSIGNEE_SIZE: usize = rsa::RsaPublicKey::MAX_SIZE;
 
-    pub const SIGNED_MSG_SIZE: usize = Self::TIER_SIZE + Self::TS_SIZE + Self::ASSIGNEE_SIZE;
+    pub const SIGNED_MSG_SIZE: usize = Self::TIER_SIZE + Self::TS_SIZE + 32;
 
     /// The `(tier, issue_time, assignee)` tuple that has to be verified as bytes.
     pub fn signature_content(
         issue_time: &DateTime<Utc>,
-        assigned_to: &Assignee,
         tier: Tier,
+        assingment_hash: &AssignmentHash,
     ) -> [u8; Self::SIGNED_MSG_SIZE] {
-        let mut cursor = Self::TIER_SIZE;
+        let mut cursor = 0;
         let mut to_be_signed = [0; Self::SIGNED_MSG_SIZE];
 
-        to_be_signed[..Self::TIER_SIZE].copy_from_slice(&(tier as u8).to_be_bytes());
+        to_be_signed[..Self::TIER_SIZE].copy_from_slice(&(tier as u8).to_le_bytes());
+        cursor += Self::TIER_SIZE;
         let timestamp = issue_time.timestamp();
         to_be_signed[cursor..cursor + Self::TS_SIZE].copy_from_slice(&timestamp.to_le_bytes());
         cursor += Self::TS_SIZE;
-        let key = serde_json::to_vec(&assigned_to).unwrap();
-        to_be_signed[cursor..cursor + key.len()].copy_from_slice(key.as_slice());
+        to_be_signed[cursor..].copy_from_slice(assingment_hash);
         to_be_signed
     }
 
@@ -793,13 +819,8 @@ impl TokenAssignment {
 
 #[test]
 fn to_be_signed_test() {
-    const RSA_4096_PUB_PEM: &str = include_str!("../examples/rsa4096-pub.pem");
-    let _to_be_signed = TokenAssignment::signature_content(
-        &get_date(2021, 7, 28),
-        &<RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_pem(RSA_4096_PUB_PEM)
-            .unwrap(),
-        Tier::Day90,
-    );
+    let _to_be_signed =
+        TokenAssignment::signature_content(&get_date(2021, 7, 28), Tier::Day90, &[0; 32]);
     // dbg!(_to_be_signed);
 }
 
@@ -827,12 +848,13 @@ impl TryFrom<StateDelta<'_>> for TokenAssignment {
 
 impl Display for TokenAssignment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let assignment = bs58::encode(self.assignment_hash).into_string();
         write!(
             f,
-            "{{ {tier} @ {slot} for {assignee:?}}}",
+            "{{ {tier} @ {slot} for assignment `{assignment}`, record: {record}}}",
             tier = self.tier,
             slot = self.time_slot,
-            assignee = self.assignee
+            record = self.token_record
         )
     }
 }

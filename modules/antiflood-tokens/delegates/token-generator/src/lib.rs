@@ -3,8 +3,6 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use locutus_aft_interface::*;
 use locutus_stdlib::prelude::*;
-use rsa::pkcs1v15::SigningKey;
-use rsa::sha2::Sha256;
 use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 
@@ -39,9 +37,9 @@ impl DelegateInterface for TokenDelegate {
                     TokenDelegateMessage::RequestNewToken(req) => {
                         allocate_token(params, &mut context, app, req)
                     }
-                    TokenDelegateMessage::Failure { .. } => Err(DelegateError::Other(
-                        "unexpected message type: failure".into(),
-                    )),
+                    TokenDelegateMessage::Failure(reason) => Err(DelegateError::Other(format!(
+                        "unexpected message type: failure; reason: {reason}"
+                    ))),
                     TokenDelegateMessage::AllocatedToken { .. } => Err(DelegateError::Other(
                         "unexpected message type: allocated token".into(),
                     )),
@@ -95,7 +93,6 @@ fn allocate_token(
         delegate_id,
         criteria,
         mut records,
-        assignee,
         assignment_hash,
     }: RequestNewToken,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
@@ -110,14 +107,13 @@ fn allocate_token(
             // request user input and add to waiting queue
             context.waiting_for_user_input.insert(request_id);
             let context: DelegateContext = (&*context).try_into()?;
-            let message = user_input(&criteria, &assignee);
+            let message = user_input(&criteria, &params.generator_private_key.to_public_key());
             let req_allocation = {
                 let msg = TokenDelegateMessage::RequestNewToken(RequestNewToken {
                     request_id,
                     delegate_id,
                     criteria,
                     records,
-                    assignee,
                     assignment_hash,
                 });
                 OutboundDelegateMsg::ApplicationMessage(
@@ -143,7 +139,6 @@ fn allocate_token(
                     delegate_id,
                     criteria,
                     records,
-                    assignee,
                     assignment_hash,
                 });
                 OutboundDelegateMsg::ApplicationMessage(
@@ -157,7 +152,7 @@ fn allocate_token(
             let application_response = match response {
                 Response::Allowed => {
                     let context: DelegateContext = (&*context).try_into()?;
-                    let Some(assignment) = records.assign(assignee, &criteria, &params.generator_private_key, assignment_hash) else {
+                    let Some(assignment) = records.assign(&criteria, &params.generator_private_key, assignment_hash) else {
                         let msg = TokenDelegateMessage::Failure(FailureReason::NoFreeSlot { delegate_id, criteria } );
                         return Ok(vec![OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app, msg.serialize()?).with_context(context),
@@ -204,6 +199,9 @@ impl TryFrom<DelegateContext> for Context {
     type Error = DelegateError;
 
     fn try_from(value: DelegateContext) -> Result<Self, Self::Error> {
+        if value == DelegateContext::default() {
+            return Ok(Self::default());
+        }
         bincode::deserialize(&value.0).map_err(|err| DelegateError::Deser(format!("{err}")))
     }
 }
@@ -224,7 +222,6 @@ impl TryFrom<&Context> for DelegateContext {
 trait TokenAssignmentInternal {
     fn assign(
         &mut self,
-        assignee: Assignee,
         criteria: &AllocationCriteria,
         private_key: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
@@ -243,26 +240,39 @@ trait TokenAssignmentInternal {
 impl TokenAssignmentInternal for TokenAllocationRecord {
     /// Assigns the next theoretical free slot. This could be out of sync due to other concurrent requests so it may fail
     /// to validate at the node. In that case the application should retry again, after refreshing the ledger version.
-    #[cfg(feature = "node")]
     fn assign(
         &mut self,
-        assignee: Assignee,
         criteria: &AllocationCriteria,
-        key: &RsaPrivateKey,
+        generator_pk: &RsaPrivateKey,
         assignment_hash: AssignmentHash,
     ) -> Option<TokenAssignment> {
-        use locutus_stdlib::time;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::sha2::Sha256;
         use rsa::signature::Signer;
-        let current = time::now();
+        #[cfg(target_family = "wasm")]
+        #[inline(always)]
+        fn current() -> DateTime<Utc> {
+            locutus_stdlib::time::now()
+        }
+        #[cfg(not(target_family = "wasm"))]
+        #[inline(always)]
+        fn current() -> DateTime<Utc> {
+            Utc::now()
+        }
+        let current = current();
         let time_slot = self.next_free_assignment(criteria, current)?;
         let assignment = {
-            let msg = TokenAssignment::signature_content(&time_slot, &assignee, criteria.frequency);
-            let signing_key = SigningKey::<Sha256>::new_with_prefix(key.clone());
+            let msg = TokenAssignment::signature_content(
+                &time_slot,
+                criteria.frequency,
+                &assignment_hash,
+            );
+            let signing_key = SigningKey::<Sha256>::new_with_prefix(generator_pk.clone());
             let signature = signing_key.sign(&msg);
             TokenAssignment {
                 tier: criteria.frequency,
                 time_slot,
-                assignee,
+                generator: generator_pk.to_public_key(),
                 signature,
                 assignment_hash,
                 token_record: criteria.contract,
@@ -270,17 +280,6 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
         };
         self.append_unchecked(assignment.clone());
         Some(assignment)
-    }
-
-    #[cfg(not(feature = "node"))]
-    fn assign(
-        &mut self,
-        _assignee: Assignee,
-        _criteria: &AllocationCriteria,
-        _key: &RsaPrivateKey,
-        _assignment_hash: AssignmentHash,
-    ) -> Option<TokenAssignment> {
-        None
     }
 
     fn next_free_assignment(

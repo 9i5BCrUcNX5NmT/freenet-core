@@ -1,12 +1,13 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use dioxus::prelude::{UnboundedReceiver, UnboundedSender};
+use futures::SinkExt;
 use locutus_aft_interface::{TokenAllocationSummary, TokenDelegateMessage};
 use locutus_stdlib::client_api::{ClientError, ClientRequest, HostResponse};
 use locutus_stdlib::prelude::UpdateData;
 use once_cell::sync::OnceCell;
 
-use crate::app::AsyncActionResult;
+use crate::DynError;
 
 type ClientRequester = UnboundedSender<ClientRequest<'static>>;
 type HostResponses = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
@@ -51,7 +52,7 @@ impl WebApi {
         };
         let (tx, rx) = futures::channel::oneshot::channel();
         let onopen_handler = move || {
-            tx.send(());
+            let _ = tx.send(());
             crate::log::debug!("connected to websocket");
         };
         let mut api = locutus_stdlib::client_api::WebApi::start(
@@ -160,7 +161,7 @@ pub(crate) async fn node_comms(
 
     use crate::{
         aft::AftRecords,
-        app::{error_handling, Identity, NodeAction, TryNodeAction},
+        app::{Identity, NodeAction},
         inbox::InboxModel,
     };
 
@@ -189,7 +190,8 @@ pub(crate) async fn node_comms(
         let mut client = api.sender_half();
         match InboxModel::load(&mut client, &identity).await {
             Err(err) => {
-                error_handling(client.into(), Err(err), TryNodeAction::LoadInbox).await;
+                node_response_error_handling(client.into(), Err(err), TryNodeAction::LoadInbox)
+                    .await;
             }
             Ok(key) => {
                 waiting_updates.entry(key).or_insert(identity);
@@ -211,19 +213,29 @@ pub(crate) async fn node_comms(
                     // FIXME: handle the different possible errors
                     match err {
                         RequestError::ContractError(ContractError::Update { key, .. }) => {
-                            // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
-                            // we should reject that pending assignment
-
-                            // FIXME: in case this is for an inbox contract we were trying to update, this means
-                            // the message wasn't delivered successfully, so may need to try again and/or notify the user
-                            todo!()
+                            if token_rec_to_id.get(&key).is_some() {
+                                // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
+                                // we should reject that pending assignment
+                                // FIXME: in case this is for an inbox contract we were trying to update, this means
+                                crate::log::error(format!("the message for {key} wasn't delivered successfully, so may need to try again and/or notify the user"), None)
+                            } else {
+                                todo!()
+                            }
                         }
-                        RequestError::ContractError(_) => todo!(),
-                        RequestError::DelegateError(_) => todo!(),
-                        RequestError::Disconnect => todo!(),
+                        RequestError::ContractError(err) => {
+                            crate::log::error(format!("FIXME: {err}"), None)
+                        }
+                        RequestError::DelegateError(error) => {
+                            crate::log::error(
+                                format!("received delegate request error: {error}"),
+                                None,
+                            );
+                        }
+                        RequestError::Disconnect => {
+                            todo!("lost connection to node, should retry connecting")
+                        }
                     }
                 }
-                crate::log::error(format!("received error: {e}"), None);
                 return;
             }
         };
@@ -312,18 +324,13 @@ pub(crate) async fn node_comms(
                     }
                 } else if let Some(identity) = token_rec_to_id.remove(&key) {
                     // is a AFT record contract
-                    match update {
-                        UpdateData::Delta(delta) => {
-                            if let Err(e) = AftRecords::update_record(identity.clone(), delta) {
-                                crate::log::error(
-                                    format!("error updating an AFT record: {e}"),
-                                    None,
-                                );
-                            }
-                            token_rec_to_id.insert(key, identity);
-                        }
-                        _ => unreachable!(),
+                    if let Err(e) = AftRecords::update_record(identity.clone(), update) {
+                        crate::log::error(
+                            format!("error updating an AFT record from delta: {e}"),
+                            None,
+                        );
                     }
+                    token_rec_to_id.insert(key, identity);
                 } else {
                     unreachable!("tried to get wrong contract key: {key}")
                 }
@@ -361,7 +368,6 @@ pub(crate) async fn node_comms(
                                     {
                                         if let Err(e) = AftRecords::allocated_assignment(
                                             &mut client,
-                                            key.clone(),
                                             assignment,
                                         )
                                         .await
@@ -382,7 +388,7 @@ pub(crate) async fn node_comms(
                                 TokenDelegateMessage::Failure(reason) => {
                                     // FIXME: this may mean a pending message waiting for a token has failed, and need to notify that in the UI
                                     crate::log::error(
-                                        format!("{reason}"),
+                                        format!("token assignment failure: {reason}"),
                                         Some(TryNodeAction::SendMessage),
                                     )
                                 }
@@ -428,7 +434,7 @@ pub(crate) async fn node_comms(
             }
             req = api.requests.next() => {
                 let Some(req) = req else { panic!("request ch closed") };
-                crate::log::debug!("sending request to API: {req:?}");
+                crate::log::debug!("sending request to API: {req}");
                 api.api.send(req).await.unwrap();
             }
             error = api.client_errors.next() => {
@@ -438,6 +444,48 @@ pub(crate) async fn node_comms(
                     None => panic!("error ch closed"),
                 }
             }
+        }
+    }
+}
+
+pub(crate) type AsyncActionResult = Result<(), (DynError, TryNodeAction)>;
+
+pub(crate) async fn node_response_error_handling(
+    mut error_channel: NodeResponses,
+    res: Result<(), DynError>,
+    action: TryNodeAction,
+) {
+    if let Err(error) = res {
+        crate::log::error(format!("{error}"), Some(action.clone()));
+        error_channel
+            .send(Err((error, action)))
+            .await
+            .expect("error channel closed");
+    } else {
+        error_channel
+            .send(Ok(()))
+            .await
+            .expect("error channel closed");
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TryNodeAction {
+    LoadInbox,
+    LoadTokenRecord,
+    SendMessage,
+    RemoveMessages,
+    GetAlias,
+}
+
+impl std::fmt::Display for TryNodeAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TryNodeAction::LoadInbox => write!(f, "loading messages"),
+            TryNodeAction::LoadTokenRecord => write!(f, "loading token record"),
+            TryNodeAction::SendMessage => write!(f, "sending message"),
+            TryNodeAction::RemoveMessages => write!(f, "removing messages"),
+            TryNodeAction::GetAlias => write!(f, "get alias"),
         }
     }
 }
