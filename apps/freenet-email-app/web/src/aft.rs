@@ -8,16 +8,16 @@ use locutus_aft_interface::{
     TokenAssignment, TokenDelegateMessage, TokenDelegateParameters,
 };
 use locutus_stdlib::client_api::{ContractRequest, DelegateRequest};
+use locutus_stdlib::prelude::UpdateData::{Delta, State as StateUpdate};
 use locutus_stdlib::prelude::{
     ApplicationMessage, ContractInstanceId, ContractKey, DelegateKey, InboundDelegateMsg,
-    Parameters, StateDelta, UpdateData, State
+    Parameters, State, UpdateData,
 };
-use locutus_stdlib::prelude::UpdateData::{Delta, State as StateUpdate};
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::RsaPublicKey;
 
 use crate::api::{node_response_error_handling, TryNodeAction};
-use crate::inbox::{InboxModel, MessageModel};
+use crate::inbox::MessageModel;
 use crate::{api::WebApiRequestClient, app::Identity, DynError};
 
 pub(crate) static TOKEN_RECORD_CODE_HASH: &str =
@@ -85,6 +85,7 @@ impl AftRecords {
         let params = TokenDelegateParameters::new(identity.key.to_public_key())
             .try_into()
             .map_err(|e| format!("{e}"))?;
+        crate::log::debug!("AFT record hash: {}", TOKEN_RECORD_CODE_HASH);
         let contract_key =
             ContractKey::from_params(TOKEN_RECORD_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         Self::get_state(client, contract_key.clone()).await?;
@@ -257,7 +258,11 @@ impl AftRecords {
         let record = match update_data {
             StateUpdate(state) => TokenAllocationRecord::try_from(state)?,
             Delta(delta) => TokenAllocationRecord::try_from(delta)?,
-            _ => return Err(DynError::from("Unexpected update data type while updating the record"))
+            _ => {
+                return Err(DynError::from(
+                    "Unexpected update data type while updating the record",
+                ))
+            }
         };
         RECORDS.with(|recs| {
             let recs = &mut *recs.borrow_mut();

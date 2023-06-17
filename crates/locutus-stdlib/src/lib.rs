@@ -7,6 +7,8 @@ mod code_hash;
 mod contract_interface;
 mod delegate_interface;
 pub(crate) mod global;
+#[cfg(all(feature = "log", target_family = "wasm"))]
+pub mod log;
 mod parameters;
 pub mod rand;
 #[cfg(all(feature = "time", target_family = "wasm"))]
@@ -30,6 +32,7 @@ pub mod prelude {
     pub use bincode;
     pub use blake2;
     pub use semver::Version;
+    pub use serde_json;
     pub use tracing;
     pub use tracing_subscriber;
 }

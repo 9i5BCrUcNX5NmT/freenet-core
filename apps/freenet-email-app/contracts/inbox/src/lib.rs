@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 
 use chrono::{DateTime, Utc};
-use locutus_aft_interface::{Tier, TokenAllocationRecord, TokenAssignment, TokenAssignmentHash};
+use locutus_aft_interface::{
+    InvalidReason as TokenInvalidReason, Tier, TokenAllocationRecord, TokenAssignment,
+    TokenAssignmentHash,
+};
 use locutus_stdlib::prelude::{blake2::Digest, *};
 use rsa::{
     pkcs1v15::{SigningKey, VerifyingKey},
@@ -89,7 +92,7 @@ pub struct Inbox {
 enum VerificationError {
     MissingContracts(Vec<ContractInstanceId>),
     TokenAssignmentMismatch,
-    InvalidInboxKey,
+    InvalidToken(TokenInvalidReason),
     InvalidMessageHash,
     WrongSignature,
 }
@@ -104,13 +107,21 @@ impl Display for VerificationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VerificationError::MissingContracts(ids) => {
-                write!(f, "Missing contracts: {:?}", ids)
+                write!(
+                    f,
+                    "Missing contracts: {}",
+                    ids.iter()
+                        .map(|c| format!("{c}"))
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                        .join(",")
+                )
             }
             VerificationError::TokenAssignmentMismatch => {
                 write!(f, "Token assignment mismatch")
             }
-            VerificationError::InvalidInboxKey => {
-                write!(f, "Invalid inbox key")
+            VerificationError::InvalidToken(reason) => {
+                write!(f, "Invalid token: {reason}")
             }
             VerificationError::InvalidMessageHash => {
                 write!(f, "Invalid message hash")
@@ -152,7 +163,6 @@ impl Inbox {
 
     fn add_messages(
         &mut self,
-        params: &InboxParams,
         allocation_records: &HashMap<ContractInstanceId, TokenAllocationRecord>,
         messages: Vec<Message>,
     ) -> Result<(), VerificationError> {
@@ -173,14 +183,13 @@ impl Inbox {
             if message.token_assignment.assignment_hash != hash.as_slice() {
                 return Err(VerificationError::InvalidMessageHash);
             }
-            self.add_message(message, params)?;
+            self.add_message(message)?;
         }
         Ok(())
     }
 
     fn verify_messages(
         &self,
-        params: &InboxParams,
         allocation_records: &HashMap<ContractInstanceId, TokenAllocationRecord>,
     ) -> Result<(), VerificationError> {
         let mut some_missing = false;
@@ -197,9 +206,12 @@ impl Inbox {
             if !records.assignment_exists(&message.token_assignment) {
                 return Err(VerificationError::TokenAssignmentMismatch);
             }
-            // (message.token_assignment.assignee == params.pub_key)
-            //     .then_some(())
-            //     .ok_or(VerificationError::InvalidInboxKey)?;
+            let verifying_key =
+                VerifyingKey::<Sha256>::from(message.token_assignment.generator.clone());
+            message
+                .token_assignment
+                .is_valid(&verifying_key)
+                .map_err(VerificationError::InvalidToken)?;
         }
         if !missing.is_empty() {
             return Err(VerificationError::MissingContracts(missing));
@@ -207,14 +219,13 @@ impl Inbox {
         Ok(())
     }
 
-    fn add_message(
-        &mut self,
-        message: Message,
-        params: &InboxParams,
-    ) -> Result<(), VerificationError> {
-        // (message.token_assignment.assignee == params.pub_key)
-        //     .then_some(())
-        //     .ok_or(VerificationError::InvalidInboxKey)?;
+    fn add_message(&mut self, message: Message) -> Result<(), VerificationError> {
+        let verifying_key =
+            VerifyingKey::<Sha256>::from(message.token_assignment.generator.clone());
+        message
+            .token_assignment
+            .is_valid(&verifying_key)
+            .map_err(VerificationError::InvalidToken)?;
         self.messages.push(message);
         Ok(())
     }
@@ -239,10 +250,10 @@ impl Inbox {
         Ok(StateSummary::from(serialized))
     }
 
-    fn merge(&mut self, other: Self, params: &InboxParams) -> Result<(), ContractError> {
+    fn merge(&mut self, other: Self) -> Result<(), ContractError> {
         if self.messages.is_empty() && self.last_update < other.last_update {
             for m in other.messages {
-                self.add_message(m, params)?;
+                self.add_message(m)?;
             }
         }
         Ok(())
@@ -347,7 +358,7 @@ impl ContractInterface for Inbox {
             return Ok(ValidateResult::RequestRelated(missing_related));
         }
 
-        match inbox.verify_messages(&params, &allocation_records) {
+        match inbox.verify_messages(&allocation_records) {
             Ok(_) => Ok(ValidateResult::Valid),
             Err(VerificationError::MissingContracts(ids)) => {
                 Ok(ValidateResult::RequestRelated(ids))
@@ -380,7 +391,7 @@ impl ContractInterface for Inbox {
             match update {
                 UpdateData::State(state) => {
                     let full_inbox = Inbox::try_from(&state)?;
-                    inbox.merge(full_inbox, &params)?;
+                    inbox.merge(full_inbox)?;
                 }
                 UpdateData::Delta(d) => match UpdateInbox::try_from(d)? {
                     UpdateInbox::AddMessages { mut messages } => {
@@ -421,7 +432,7 @@ impl ContractInterface for Inbox {
 
         if missing_related.is_empty() {
             inbox
-                .add_messages(&params, &allocation_records, new_messages)
+                .add_messages(&allocation_records, new_messages)
                 .map_err(|err| ContractError::Other(format!("{err}")))?;
             inbox.remove_messages(rm_messages);
             // FIXME: uncomment next line, right now it pulls the `time` dep on the web UI if we enable which is not what we want

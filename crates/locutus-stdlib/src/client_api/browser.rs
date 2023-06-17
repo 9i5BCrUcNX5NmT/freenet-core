@@ -45,13 +45,22 @@ impl WebApi {
                     .dyn_into::<js_sys::ArrayBuffer>()
                     .unwrap();
                 let bytes = js_sys::Uint8Array::new(&array_buffer).to_vec();
-
                 let response: HostResult = match rmp_serde::from_slice(&bytes) {
                     Ok(val) => val,
                     Err(err) => {
-                        eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
-                            "error": format!("{err}"), "source": "host response deser"
-                        })));
+                        eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({})));
+                        if let Ok(untyped) = rmpv::decode::read_value(&mut &*bytes) {
+                            eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
+                                "error": format!("{err}"),
+                                "source": "host response deserialization",
+                                "json": format!("{untyped}")
+                            })));
+                        } else {
+                            eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
+                                "error": format!("{err}"),
+                                "source": "host response deserialization"
+                            })));
+                        }
                         return;
                     }
                 };
@@ -88,14 +97,14 @@ impl WebApi {
         conn.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
         onopen_callback.forget();
 
-        let mut eh = error_handler.clone();
-        let onclose_callback = Closure::<dyn FnOnce()>::once(move || {
-            tracing::warn!("connection closed");
-            eh(Error::ConnectionError(
-                serde_json::json!({ "error": "connection closed", "source": "close" }),
-            ));
-        });
-        conn.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
+        // let mut eh = error_handler.clone();
+        // let onclose_callback = Closure::<dyn FnOnce()>::once(move || {
+        //     tracing::warn!("connection closed");
+        //     eh(Error::ConnectionError(
+        //         serde_json::json!({ "error": "connection closed", "source": "close" }),
+        //     ));
+        // });
+        // conn.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
 
         conn.set_binary_type(web_sys::BinaryType::Blob);
         WebApi {

@@ -1939,6 +1939,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1949,7 +1950,6 @@ dependencies = [
  "bs58 0.5.0",
  "chacha20poly1305 0.10.1",
  "chrono",
- "crossbeam",
  "dioxus",
  "dioxus-desktop",
  "dioxus-web",

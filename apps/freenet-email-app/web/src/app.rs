@@ -82,7 +82,7 @@ pub(crate) fn app(cx: Scope) -> Element {
     {
         let _sync = use_coroutine::<NodeAction, _, _>(cx, move |rx| {
             let fut = crate::api::node_comms(rx, user.read().identities.clone(), inbox_data)
-                .map(|_| Ok(JsValue::TRUE));
+                .map(|_| Ok(JsValue::NULL));
             let _ = wasm_bindgen_futures::future_to_promise(fut);
             async {}.boxed_local()
         });
@@ -357,6 +357,12 @@ impl Identity {
 impl std::hash::Hash for Identity {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.key.hash(state)
+    }
+}
+
+impl std::fmt::Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &*self.alias)
     }
 }
 

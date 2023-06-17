@@ -10,7 +10,7 @@ use once_cell::sync::OnceCell;
 use crate::DynError;
 
 type ClientRequester = UnboundedSender<ClientRequest<'static>>;
-type HostResponses = crossbeam::channel::Receiver<Result<HostResponse, ClientError>>;
+type HostResponses = UnboundedReceiver<Result<HostResponse, ClientError>>;
 
 pub(crate) type NodeResponses = UnboundedSender<AsyncActionResult>;
 
@@ -45,10 +45,17 @@ impl WebApi {
     fn new() -> Result<Self, String> {
         use futures::{SinkExt, StreamExt};
         let conn = web_sys::WebSocket::new("ws://localhost:50509/contract/command/").unwrap();
-        let (send_host_responses, host_responses) = crossbeam::channel::unbounded();
+        let (send_host_responses, host_responses) = futures::channel::mpsc::unbounded();
         let (send_half, requests) = futures::channel::mpsc::unbounded();
         let result_handler = move |result: Result<HostResponse, ClientError>| {
-            send_host_responses.send(result).expect("channel open");
+            let mut send_host_responses_clone = send_host_responses.clone();
+            let _ = wasm_bindgen_futures::future_to_promise(async move {
+                send_host_responses_clone
+                    .send(result)
+                    .await
+                    .expect("channel open");
+                Ok(wasm_bindgen::JsValue::NULL)
+            });
         };
         let (tx, rx) = futures::channel::oneshot::channel();
         let onopen_handler = move || {
@@ -107,7 +114,6 @@ impl WebApiRequestClient {
         &mut self,
         request: locutus_stdlib::client_api::ClientRequest<'static>,
     ) -> Result<(), locutus_stdlib::client_api::Error> {
-        use futures::SinkExt;
         self.sender
             .send(request)
             .await
@@ -145,13 +151,12 @@ pub(crate) async fn node_comms(
     mut rx: UnboundedReceiver<crate::app::NodeAction>,
     contracts: Vec<crate::app::Identity>,
     // todo: refactor: instead of passing this arround,
-    // where necessary we could be gettign thef resh data via static methods calls to InboxModel
+    // where necessary we could be getting the fresh data via static methods calls to Inbox
     // and store the information there in thread locals
     mut inboxes: crate::app::InboxesData,
 ) {
     use std::{rc::Rc, sync::Arc};
 
-    use crossbeam::channel::TryRecvError;
     use freenet_email_inbox::Inbox as StoredInbox;
     use futures::StreamExt;
     use locutus_stdlib::{
@@ -217,9 +222,13 @@ pub(crate) async fn node_comms(
                                 // FIXME: in case this is for a token record which is PENDING_CONFIRMED_ASSIGNMENTS
                                 // we should reject that pending assignment
                                 // FIXME: in case this is for an inbox contract we were trying to update, this means
-                                crate::log::error(format!("the message for {key} wasn't delivered successfully, so may need to try again and/or notify the user"), None)
-                            } else {
-                                todo!()
+                                let id = token_rec_to_id.get(&key).unwrap();
+                                let alias = id.alias();
+                                crate::log::error(format!("the message for {alias} (aft contract: {key}) wasn't delivered successfully, so may need to try again and/or notify the user"), None);
+                            } else if inbox_to_id.get(&key).is_some() {
+                                let id = inbox_to_id.get(&key).unwrap();
+                                let alias = id.alias();
+                                crate::log::error(format!("the message for {alias} (inbox contract: {key}) wasn't delievered succesffully, so may need to try again and/or notify the user"), None);
                             }
                         }
                         RequestError::ContractError(err) => {
@@ -239,6 +248,7 @@ pub(crate) async fn node_comms(
                 return;
             }
         };
+        crate::log::debug!("got node response: {res}");
         match res {
             HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key, state, ..
@@ -276,6 +286,7 @@ pub(crate) async fn node_comms(
                     }
                     inbox_to_id.insert(key, identity);
                 } else if let Some(identity) = token_rec_to_id.remove(&key) {
+                    crate::log::debug!("updating AFT record for {identity}");
                     // is a AFT record contract
                     if let Err(e) = AftRecords::set(identity.clone(), state.into()) {
                         crate::log::error(format!("error setting an AFT record: {e}"), None);
@@ -412,8 +423,9 @@ pub(crate) async fn node_comms(
     }
 
     loop {
-        match api.host_responses.try_recv() {
-            Ok(res) => {
+        futures::select! {
+            r = api.host_responses.next() => {
+                let Some(res) = r else { panic!("async action ch closed") };
                 handle_response(
                     res,
                     &mut inbox_contract_to_id,
@@ -422,12 +434,6 @@ pub(crate) async fn node_comms(
                 )
                 .await;
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                panic!("response ch closed");
-            }
-        }
-        futures::select! {
             req = rx.next() => {
                 let Some(req) = req else { panic!("async action ch closed") };
                 handle_action(req, &api, &mut inbox_contract_to_id).await;
