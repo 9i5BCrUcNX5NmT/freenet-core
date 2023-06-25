@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 mod contract_structs;
 
 use contract_structs::*;
