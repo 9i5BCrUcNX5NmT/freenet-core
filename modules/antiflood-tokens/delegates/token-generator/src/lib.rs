@@ -267,18 +267,19 @@ impl TokenAssignmentInternal for TokenAllocationRecord {
                 criteria.frequency,
                 &assignment_hash,
             );
-            let signing_key = SigningKey::<Sha256>::new_with_prefix(generator_pk.clone());
+            let signing_key = SigningKey::<Sha256>::new(generator_pk.clone());
             let signature = signing_key.sign(&msg);
             #[cfg(target_family = "wasm")]
             {
                 let pk = generator_pk
+                    .to_public_key()
                     .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
                     .unwrap()
                     .split_whitespace()
                     .collect::<String>();
-                locutus_stdlib::log::info(&format!(
-                    "signed message {msg:?} with pub key: `{pk}`, signature: {signature}"
-                ));
+                // locutus_stdlib::log::info(&format!(
+                //     "signed message {msg:?} with pub key: `{pk}`, signature: {signature}"
+                // ));
             }
             TokenAssignment {
                 tier: criteria.frequency,

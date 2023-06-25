@@ -85,7 +85,6 @@ impl AftRecords {
         let params = TokenDelegateParameters::new(identity.key.to_public_key())
             .try_into()
             .map_err(|e| format!("{e}"))?;
-        crate::log::debug!("AFT record hash: {}", TOKEN_RECORD_CODE_HASH);
         let contract_key =
             ContractKey::from_params(TOKEN_RECORD_CODE_HASH, params).map_err(|e| format!("{e}"))?;
         Self::get_state(client, contract_key.clone()).await?;
@@ -217,8 +216,11 @@ impl AftRecords {
             std::time::Duration::from_secs(365 * 24 * 3600),
             token_record,
         )?;
-        // fixme: should be using the state of the aft record contract here instead:
-        let records = TokenAllocationRecord::new(HashMap::default());
+        // todo: optimize so we don't clone the whole record and instead use a smart pointer
+        let Some(records) = RECORDS.with(|recs| recs.borrow().get(generator_id).cloned()) else {
+            // todo: somehow propagate this to the UI so the user retries /or we retry automatically/ later
+            return Err(format!("failed to get token record for id: {}", generator_id.alias()).into())
+        };
         let token_request = TokenDelegateMessage::RequestNewToken(RequestNewToken {
             request_id: REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             delegate_id: delegate_key.clone().into(),
@@ -257,11 +259,14 @@ impl AftRecords {
     pub fn update_record(identity: Identity, update_data: UpdateData) -> Result<(), DynError> {
         let record = match update_data {
             StateUpdate(state) => {
-                crate::log::debug!("updating record with state: {:?}", serde_json::to_vec(&state)?);
+                crate::log::debug!(
+                    "updating aft record for `{}` with whole state",
+                    identity.alias()
+                );
                 TokenAllocationRecord::try_from(state)?
             }
             Delta(delta) => {
-                crate::log::debug!("updating record with delta: {delta:?}");
+                crate::log::debug!("updating aft record for `{}` with delta", identity.alias());
                 TokenAllocationRecord::try_from(delta)?
             }
             _ => {

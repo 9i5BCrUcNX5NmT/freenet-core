@@ -579,7 +579,7 @@ impl Display for AllocationCriteria {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TokenAllocationRecord {
     /// A list of issued tokens.
     ///
@@ -769,21 +769,23 @@ pub struct TokenAssignment {
 
 mod token_sig_ser {
     use super::*;
+    use rsa::signature::SignatureEncoding;
     use serde::{Deserializer, Serializer};
 
     pub fn deserialize<'de, D>(deser: D) -> Result<Signature, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let d = <Box<[u8]> as Deserialize>::deserialize(deser)?;
-        Ok(d.into())
+        use serde::de::Error;
+        let bytes = <Box<[u8]> as Deserialize>::deserialize(deser)?;
+        Signature::try_from(&*bytes).map_err(<D as Deserializer>::Error::custom)
     }
 
     pub fn serialize<S>(sig: &Signature, ser: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let s: Box<[u8]> = sig.clone().into();
+        let s: Box<[u8]> = sig.to_bytes();
         s.serialize(ser)
     }
 }
