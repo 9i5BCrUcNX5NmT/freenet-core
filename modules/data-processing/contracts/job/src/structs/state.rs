@@ -11,9 +11,9 @@ use serde::{Serialize, Deserialize};
 /// by a worker.
 #[derive(Serialize, Deserialize)]
 pub struct JobState {
-    authorizing_tokens : Vec<TokenAssignment>,
+    pub authorizing_tokens : Vec<TokenAssignment>,
 
-    job_results : Vec<JobResult>,
+    pub job_results : Vec<JobResult>,
 }
 
 /// The output of a job and related metadata.

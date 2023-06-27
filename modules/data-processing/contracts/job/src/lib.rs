@@ -1,2 +1,2 @@
 mod structs;
-mod contract_impl;
+mod contract;
