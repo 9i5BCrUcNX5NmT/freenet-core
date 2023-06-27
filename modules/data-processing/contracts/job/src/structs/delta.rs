@@ -1,3 +1,6 @@
+use locutus_stdlib::prelude::*;
+use serde::*;
+
 #[derive(Serialize, Deserialize)]
 pub struct JobDelta {
 }
