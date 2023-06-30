@@ -30,10 +30,6 @@ impl ContractInterface for JobState {
             return Ok(ValidateResult::RequestRelated(missing_related));
         }
 
-        for token in job_state.authorizing_tokens {
-            
-        }
-
         todo!()
     }
 
@@ -66,4 +62,5 @@ impl ContractInterface for JobState {
     ) -> Result<StateDelta<'static>, ContractError> {
         todo!()
     }
+
 }
