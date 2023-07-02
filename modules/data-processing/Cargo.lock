@@ -565,13 +565,14 @@ name = "locutus-dataproc-common"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
  "bs58",
  "chrono",
  "locutus-stdlib",
  "rand",
  "rsa 0.8.2",
  "serde",
- "serde_json",
+ "serde_bytes",
  "strum",
  "thiserror",
 ]

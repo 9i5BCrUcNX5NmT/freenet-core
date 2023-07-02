@@ -1,5 +1,6 @@
 pub mod dispatcher;
 pub mod segment;
+pub mod utils;
 
 pub use crate::segment::Segment;
 

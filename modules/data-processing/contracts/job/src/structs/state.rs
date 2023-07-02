@@ -1,12 +1,10 @@
-use std::{error::Error, fmt::{Formatter, self}, collections::HashMap};
-
 use antiflood_tokens::TokenAssignment;
-use locutus_stdlib::prelude::{*, blake2::Blake2s256};
+use locutus_stdlib::prelude::{*, bincode::*};
 use p256::{
     ecdsa::{VerifyingKey, Signature},
 };
-use blake3::Hash;
-use serde::{Serialize, Deserialize, de::Visitor, Deserializer, Serializer};
+use serde::{Serialize, Deserialize};
+use std::result::Result;
 
 /// The state of the job contract contains the tokens authorizing
 /// the job to be performed, and any results created so far
@@ -27,33 +25,51 @@ pub struct JobState {
     pub outputs : Vec<JobOutput>,
 }
 
-/// 
+/// One specific output of a job, along with a list of the workers who agree with this
+/// output.
 #[derive(Serialize, Deserialize)]
 pub struct JobOutput {
+    /// The output bytes of the job.
     pub output : Vec<u8>,
+
+    // The workers who agree with this output.
     pub worker_verifications : Vec<WorkerVerification>,
 }
 
-/// The output of a job and related metadata.
+/// A record that a worker has verified this output of a job.
 #[derive(Serialize, Deserialize)]
 pub struct WorkerVerification {
+    /// The time this verification was generated, a worker can submit multiple
+    /// verifications for the same output, all but the most recent will be
+    /// ignored. This is to allow workers to update their verification if,
+    /// for example, an input contract state changes.
+    verification_time : chrono::DateTime<chrono::Utc>,
+    
+    /// The signature of the worker who verified this output
     job_output_signature : Signature,
+    
+    /// The public key of the worker who verified this output
     worker : VerifyingKey,
+
+    /// An antiflood token that was valid at the time of verification
     antiflood_token : TokenAssignment,
 }
 
+/*
+ * Convenience methods for converting between State and JobState
+ */
 
 impl TryFrom<State<'_>> for JobState {
     type Error = ContractError;
     fn try_from(params: State<'_>) -> Result<Self, Self::Error> {
-        serde_json::from_slice(params.as_ref())
+        deserialize(params.as_ref())
             .map_err(|err| ContractError::Deser(format!("{err}")))
     }
 }
 
 impl TryFrom<JobState> for State<'static> {
-    type Error = serde_json::Error;
+    type Error = Box<bincode::ErrorKind>;
     fn try_from(params: JobState) -> Result<Self, Self::Error> {
-        serde_json::to_vec(&params).map(Into::into)
+        serialize(&params).map(Into::into)
     }
 }

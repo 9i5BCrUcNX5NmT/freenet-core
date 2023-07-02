@@ -1,6 +1,9 @@
-use locutus_stdlib::prelude::*;
+use locutus_stdlib::prelude::{*, bincode::*};
 use serde::*;
+use std::result::Result;
 
+/// The parameters of this job, containing the JobSpec which contains the
+/// WASM code to be executed.
 #[derive(Serialize, Deserialize)]
 pub struct JobParams {
     job_spec : JobSpec,
@@ -14,23 +17,21 @@ pub enum JobSpec {
     }
 }
 
-
+/*
+ * Convenience methods for converting between Parameters and JobParams
+ */
 
 impl TryFrom<Parameters<'_>> for JobParams {
     type Error = ContractError;
     fn try_from(params: Parameters<'_>) -> Result<Self, Self::Error> {
-        bincode::deserialize(params.as_ref())
-            .map_err(|err| ContractError::Deser(format!("{}", err)))
+        deserialize(params.as_ref())
+            .map_err(|err| ContractError::Deser(format!("{err}")))
     }
 }
 
 impl TryFrom<JobParams> for Parameters<'static> {
-    type Error = bincode::ErrorKind;
-    
+    type Error = Box<bincode::ErrorKind>;
     fn try_from(params: JobParams) -> Result<Self, Self::Error> {
-        let serialized = bincode::serialize(&params)
-            .map_err(|e| *e)?; // Convert from Box<ErrorKind> to ErrorKind
-
-        Ok(Parameters::from(serialized)) // Convert Vec<u8> to Parameters
+        serialize(&params).map(Into::into)
     }
 }

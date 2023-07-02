@@ -1,8 +1,11 @@
+use common::utils::blake3_wrapper::Blake3HashWrapper;
 use locutus_stdlib::prelude::*;
 use serde::*;
+use super::state::*;
 
 #[derive(Serialize, Deserialize)]
 pub struct JobDelta {
+    job_outputs : Vec<JobOutput>,
 }
 
 impl TryFrom<StateDelta<'_>> for JobDelta {
@@ -15,6 +18,13 @@ impl TryFrom<StateDelta<'_>> for JobDelta {
 
 #[derive(Serialize, Deserialize)]
 pub struct JobSummary {
+    job_outputs : Vec<JobOutputSummary>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct JobOutputSummary {
+    output_hash : Blake3HashWrapper,
+    worker_verifications : Vec<WorkerVerification>,
 }
 
 impl TryFrom<StateSummary<'_>> for JobSummary {
